@@ -146,9 +146,25 @@ Parameters:
     Default: bdahiya2007
     Description: GitHub username/org that owns the repo allowed to assume the CI deploy role via OIDC.
 
+  GitHubOrgId:
+    Type: String
+    Default: '5674538'
+    Description: >-
+      Numeric, immutable GitHub user/org ID for GitHubOrg (find via `gh api users/<org> --jq .id`).
+      GitHub's OIDC "sub" claim embeds this alongside the name (repo:org@id/repo@id:ref:...) so the
+      trust policy still matches correctly even if the org/user is ever renamed - and, just as
+      importantly, so a *different* account that later reuses the same renamed username can't assume
+      this role by name alone.
+
   GitHubRepo:
     Type: String
     Description: GitHub repository name (without owner) allowed to assume the CI deploy role via OIDC.
+
+  GitHubRepoId:
+    Type: String
+    Description: >-
+      Numeric, immutable GitHub repository ID for GitHubRepo (find via `gh api repos/<org>/<repo> --jq .id`).
+      Same reasoning as GitHubOrgId - matched as part of the OIDC "sub" claim, not just the repo name.
 
   GitHubBranch:
     Type: String
@@ -750,7 +766,7 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}@${GitHubOrgId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/heads/${GitHubBranch}
       Policies:
         - PolicyName: DeployThreeTierStack
           PolicyDocument:
