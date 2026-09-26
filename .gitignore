@@ -1,0 +1,46 @@
+# --- Secrets: private keys, credentials ---
+*.pem
+*.key
+*.ppk
+*.p12
+*.pfx
+*credentials*
+*.env
+.env.*
+
+# --- Terraform ---
+# Local .terraform directories (provider plugins/binaries - large, regenerable via `terraform init`)
+**/.terraform/*
+# Terraform state files can contain sensitive resource attributes in plaintext
+*.tfstate
+*.tfstate.*
+# State lock info
+.terraform.tfstate.lock.info
+# tfvars files commonly hold real secrets (e.g. db_password) - never commit these
+*.tfvars
+*.tfvars.json
+# Terraform CLI config that may embed credentials
+.terraformrc
+terraform.rc
+# Crash logs
+crash.log
+crash.*.log
+# Override files (local-only overrides, not meant to be shared)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# NOTE: .terraform.lock.hcl is intentionally NOT ignored - it should be committed
+# for reproducible provider version resolution.
+
+# --- OS / editor noise ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# --- Logs / temp output ---
+*.log

@@ -1,0 +1,70 @@
+name: Deploy CloudFormation Stack
+
+# Authenticates via GitHub OIDC - no long-lived AWS credentials stored in this repo.
+# GitHub Actions assumes GITHUB_ACTIONS_DEPLOY_ROLE_ARN directly; AWS trusts the
+# request based on a short-lived token whose "sub" claim is checked against this
+# exact repo + branch (see GitHubActionsDeployRole in cloudformation/vpc.yaml).
+#
+# Required GitHub repository secrets (Settings -> Secrets and variables -> Actions):
+#   AWS_DEPLOY_ROLE_ARN - the GitHubActionsDeployRoleArn stack output, e.g.
+#                         arn:aws:iam::<account-id>:role/three-tier-app-github-actions-deploy-role
+#   DB_PASSWORD         - value for the CloudFormation DBPassword parameter (8-41 chars, no / @ " or spaces)
+#   KEY_PAIR_NAME       - name of an existing EC2 key pair in us-east-1 (CloudFormation KeyPairName parameter)
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: cloudformation-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: three-tier-app-network
+  TEMPLATE_FILE: cloudformation/vpc.yaml
+
+jobs:
+  deploy:
+    name: Deploy to AWS
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required to request the OIDC token
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate CloudFormation template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://${{ env.TEMPLATE_FILE }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file ${{ env.TEMPLATE_FILE }} \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              DBPassword=${{ secrets.DB_PASSWORD }} \
+              KeyPairName=${{ secrets.KEY_PAIR_NAME }}
+
+      - name: Show stack outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query "Stacks[0].Outputs" \
+            --output table

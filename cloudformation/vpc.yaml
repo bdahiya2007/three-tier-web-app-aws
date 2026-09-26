@@ -1,0 +1,1066 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Three-tier web app. Creates a VPC in us-east-1 spanning two Availability
+  Zones, with an Application Load Balancer and an Auto Scaling Group (2-3
+  instances) launching WordPress EC2 instances across two public subnets,
+  a MySQL RDS instance in the private subnet(s), an EFS file system mounted
+  at wp-content on every instance so media uploads and content are shared
+  across the group, a CloudWatch dashboard showing EC2 CPUUtilization, RDS
+  CPUUtilization, and ALB RequestCount, and logging: ALB access logs to S3,
+  each instance's Apache error log and cloud-init output shipped to
+  CloudWatch Logs via the CloudWatch agent, and the RDS error log exported
+  to CloudWatch Logs (with retention set via a small Lambda-backed custom
+  resource, since RDS auto-creates that log group and CloudFormation can't
+  own it directly without risking replacing the database). The database
+  itself remains single-AZ; a second private subnet is included only
+  because RDS requires a DB subnet group to
+  span at least two Availability Zones.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: three-tier-app
+    Description: Name prefix used to tag resources.
+
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+    Description: Availability Zone for the public subnet, primary private subnet, and RDS instance.
+
+  SecondAvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1b
+    Description: Second Availability Zone, required only to satisfy the RDS DB subnet group's multi-AZ subnet requirement.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC.
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for the public subnet.
+
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for the private subnet.
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: CIDR block for the second private subnet (DB subnet group only).
+
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.4.0/24
+    Description: CIDR block for the second public subnet (ALB and Auto Scaling Group).
+
+  DBName:
+    Type: String
+    Default: appdb
+    Description: Initial database name created on the RDS instance.
+
+  DBUsername:
+    Type: String
+    Default: admin
+    Description: Master username for the RDS instance.
+    NoEcho: true
+
+  DBPassword:
+    Type: String
+    Description: Master password for the RDS instance (8-41 characters, no '/', '@', '"', or spaces).
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    AllowedPattern: "[^/@\"\\s]*"
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: RDS instance class.
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    Description: Allocated storage for the RDS instance, in GiB.
+
+  DBEngineVersion:
+    Type: String
+    Default: '8.0'
+    Description: MySQL engine version.
+
+  DBBackupRetentionPeriod:
+    Type: Number
+    Default: 1
+    Description: Automated backup retention period in days (free-tier accounts are capped at 1).
+
+  DBSnapshotIdentifier:
+    Type: String
+    Default: ''
+    Description: Optional RDS snapshot identifier to restore the database from instead of creating an empty one. Leave blank for a fresh database. When set, DBUsername must match the snapshot's original master username (the password is not restorable from a snapshot and must be reset afterward via ModifyDBInstance).
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 key pair (in this region) for SSH access to the web server.
+
+  WebServerInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for the WordPress web server.
+
+  SSHLocationCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: CIDR block allowed to SSH into the web server. Restrict this to your own IP (e.g. 203.0.113.5/32) instead of leaving it open to the internet.
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: SSM parameter that resolves to the latest Amazon Linux 2023 AMI ID.
+
+  AsgMinSize:
+    Type: Number
+    Default: 2
+    Description: Minimum number of WordPress instances in the Auto Scaling Group.
+
+  AsgMaxSize:
+    Type: Number
+    Default: 3
+    Description: Maximum number of WordPress instances in the Auto Scaling Group.
+
+  AsgDesiredCapacity:
+    Type: Number
+    Default: 2
+    Description: Desired number of WordPress instances in the Auto Scaling Group.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    Description: Retention period (days) for CloudWatch Logs log groups (instance and RDS logs). Kept short by default to minimize cost.
+
+  GitHubOrg:
+    Type: String
+    Default: bdahiya2007
+    Description: GitHub username/org that owns the repo allowed to assume the CI deploy role via OIDC.
+
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name (without owner) allowed to assume the CI deploy role via OIDC.
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch allowed to assume the CI deploy role via OIDC. Only pushes to this exact branch can authenticate as this role.
+
+Conditions:
+  RestoreFromSnapshot: !Not [!Equals [!Ref DBSnapshotIdentifier, '']]
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-subnet
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref AvailabilityZone
+      CidrBlock: !Ref PrivateSubnetCidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref SecondAvailabilityZone
+      CidrBlock: !Ref PublicSubnet2Cidr
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-subnet-2
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Ref SecondAvailabilityZone
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-subnet-2
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-rt
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub Subnet group for ${EnvironmentName} RDS instance
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-db-subnet-group
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL access from the web server only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+          Description: MySQL access from the WordPress web server
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-db-sg
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from the ALB and SSH access to the WordPress web servers
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: HTTP access from the ALB only
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocationCidr
+          Description: SSH access
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-web-sg
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP access to the Application Load Balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access from anywhere
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb-sg
+
+  ALBLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldAccessLogs
+            Status: Enabled
+            ExpirationInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb-logs
+
+  ALBLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ALBLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowELBRootAccountLogDelivery
+            Effect: Allow
+            Principal:
+              AWS: 'arn:aws:iam::127311923021:root'
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${ALBLogsBucket}/alb-logs/AWSLogs/${AWS::AccountId}/*
+          - Sid: AllowELBLogDeliveryServicePutObject
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${ALBLogsBucket}/alb-logs/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+          - Sid: AllowELBLogDeliveryServiceGetBucketAcl
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub arn:aws:s3:::${ALBLogsBucket}
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: ALBLogsBucketPolicy
+    Properties:
+      Name: !Sub ${EnvironmentName}-alb
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !Ref ALBLogsBucket
+        - Key: access_logs.s3.prefix
+          Value: alb-logs
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-alb
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-tg
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-tg
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS access from the WordPress web servers
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+          Description: NFS access from the WordPress web servers
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-efs-sg
+
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      BackupPolicy:
+        Status: DISABLED
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-efs
+
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PublicSubnet
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  CloudWatchAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-cw-agent-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  CloudWatchAgentInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref CloudWatchAgentRole
+
+  HttpdErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${EnvironmentName}/httpd-error
+      RetentionInDays: !Ref LogRetentionDays
+
+  CloudInitLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${EnvironmentName}/cloud-init-output
+      RetentionInDays: !Ref LogRetentionDays
+
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - DBInstance
+      - EFSMountTarget1
+      - EFSMountTarget2
+      - HttpdErrorLogGroup
+      - CloudInitLogGroup
+    Properties:
+      LaunchTemplateName: !Sub ${EnvironmentName}-wordpress-lt
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref WebServerInstanceType
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile:
+          Arn: !GetAtt CloudWatchAgentInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref WebServerSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName}-wordpress
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash -xe
+              dnf update -y
+              dnf install -y httpd php8.3 php8.3-mysqlnd php8.3-fpm php8.3-gd php8.3-xml php8.3-mbstring mariadb105 amazon-efs-utils amazon-cloudwatch-agent wget
+
+              mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+              cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWAGENTEOF'
+              {
+                "logs": {
+                  "logs_collected": {
+                    "files": {
+                      "collect_list": [
+                        {
+                          "file_path": "/var/log/httpd/error_log",
+                          "log_group_name": "${HttpdErrorLogGroup}",
+                          "log_stream_name": "{instance_id}"
+                        },
+                        {
+                          "file_path": "/var/log/cloud-init-output.log",
+                          "log_group_name": "${CloudInitLogGroup}",
+                          "log_stream_name": "{instance_id}"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+              CWAGENTEOF
+
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                -a fetch-config -m ec2 -s \
+                -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+              systemctl enable --now php-fpm
+              systemctl start httpd
+              systemctl enable httpd
+
+              cd /tmp
+              wget -q https://wordpress.org/latest.tar.gz
+              tar -xzf latest.tar.gz
+
+              cp -r wordpress/* /var/www/html/
+              cd /var/www/html
+              cp wp-config-sample.php wp-config.php
+
+              sed -i "s/database_name_here/${DBName}/" wp-config.php
+              sed -i "s/username_here/${DBUsername}/" wp-config.php
+              sed -i "s/password_here/${DBPassword}/" wp-config.php
+              sed -i "s/localhost/${DBInstance.Endpoint.Address}/" wp-config.php
+
+              mkdir -p /mnt/efs-seed
+              for i in 1 2 3 4 5 6; do
+                mount -t efs -o tls ${EFSFileSystem}:/ /mnt/efs-seed && break
+                sleep 10
+              done
+              if [ -z "$(ls -A /mnt/efs-seed)" ]; then
+                cp -a /var/www/html/wp-content/. /mnt/efs-seed/
+              fi
+              umount /mnt/efs-seed
+
+              echo "${EFSFileSystem}:/ /var/www/html/wp-content efs _netdev,tls 0 0" >> /etc/fstab
+              mount -a
+
+              chown -R apache:apache /var/www/html
+              chmod -R 755 /var/www/html
+
+              systemctl restart httpd
+
+  WebServerAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${EnvironmentName}-asg
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+        - !Ref PublicSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref AsgMinSize
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref AsgDesiredCapacity
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-wordpress
+          PropagateAtLaunch: true
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBName: !If [RestoreFromSnapshot, !Ref 'AWS::NoValue', !Ref DBName]
+      Engine: mysql
+      EngineVersion: !Ref DBEngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBSnapshotIdentifier: !If [RestoreFromSnapshot, !Ref DBSnapshotIdentifier, !Ref 'AWS::NoValue']
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      AvailabilityZone: !Ref AvailabilityZone
+      MultiAZ: false
+      PubliclyAccessible: false
+      StorageType: gp3
+      BackupRetentionPeriod: !Ref DBBackupRetentionPeriod
+      DeletionProtection: false
+      EnableCloudwatchLogsExports:
+        - error
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-mysql
+
+  RdsLogRetentionFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-rds-log-retention-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SetLogRetention
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: logs:PutRetentionPolicy
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/instance/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${EnvironmentName}-rds-log-retention:*
+
+  RdsLogRetentionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-rds-log-retention
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt RdsLogRetentionFunctionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import urllib.request
+          import boto3
+
+          def handler(event, context):
+              physical_id = event.get('PhysicalResourceId', 'RdsLogRetention')
+              response_data = {}
+              try:
+                  if event['RequestType'] in ('Create', 'Update'):
+                      log_group = event['ResourceProperties']['LogGroupName']
+                      retention = int(event['ResourceProperties']['RetentionInDays'])
+                      client = boto3.client('logs')
+                      for attempt in range(10):
+                          try:
+                              client.put_retention_policy(logGroupName=log_group, retentionInDays=retention)
+                              break
+                          except client.exceptions.ResourceNotFoundException:
+                              time.sleep(6)
+                      else:
+                          raise Exception('Log group %s never appeared' % log_group)
+                  send(event, context, 'SUCCESS', response_data, physical_id)
+              except Exception as e:
+                  response_data['Error'] = str(e)
+                  send(event, context, 'FAILED', response_data, physical_id)
+
+          def send(event, context, status, data, physical_id):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': 'See CloudWatch Logs: ' + context.log_stream_name,
+                  'PhysicalResourceId': physical_id,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data
+              }).encode('utf-8')
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT', headers={'Content-Type': ''})
+              urllib.request.urlopen(req)
+
+  DBErrorLogRetention:
+    Type: Custom::SetRdsLogRetention
+    DependsOn: DBInstance
+    Properties:
+      ServiceToken: !GetAtt RdsLogRetentionFunction.Arn
+      LogGroupName: !Sub /aws/rds/instance/${DBInstance}/error
+      RetentionInDays: !Ref LogRetentionDays
+
+  GitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-github-actions-deploy-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}
+      Policies:
+        - PolicyName: DeployThreeTierStack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudFormation actions on this specific stack (and any change sets under it).
+              # ValidateTemplate has no resource-level support, hence the separate "*" statement below.
+              - Sid: CloudFormationStackAccess
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListStackResources
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/three-tier-app-network/*
+              - Sid: CloudFormationTemplateValidation
+                Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: '*'
+              # EC2, Auto Scaling, RDS, ELBv2, EFS, Logs, CloudWatch, and Lambda mostly don't support
+              # resource-level IAM permissions for the create/describe/modify actions a stack deploy
+              # needs (a well-documented AWS limitation, not a shortcut) - scoped tightly by action list instead.
+              - Sid: InfrastructureServices
+                Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - ec2:CreateVpc
+                  - ec2:DeleteVpc
+                  - ec2:ModifyVpcAttribute
+                  - ec2:CreateSubnet
+                  - ec2:DeleteSubnet
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:CreateInternetGateway
+                  - ec2:DeleteInternetGateway
+                  - ec2:AttachInternetGateway
+                  - ec2:DetachInternetGateway
+                  - ec2:CreateRouteTable
+                  - ec2:DeleteRouteTable
+                  - ec2:CreateRoute
+                  - ec2:DeleteRoute
+                  - ec2:AssociateRouteTable
+                  - ec2:DisassociateRouteTable
+                  - ec2:CreateLaunchTemplate
+                  - ec2:CreateLaunchTemplateVersion
+                  - ec2:ModifyLaunchTemplate
+                  - ec2:DeleteLaunchTemplate
+                  - ec2:DeleteLaunchTemplateVersions
+                  - ec2:RunInstances
+                  - ec2:TerminateInstances
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                  - autoscaling:*
+                  - rds:*
+                  - elasticloadbalancing:*
+                  - elasticfilesystem:*
+                  - logs:*
+                  - cloudwatch:*
+                  - lambda:CreateFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:InvokeFunction
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:TagResource
+                  - ssm:GetParameters
+                  - ssm:GetParameter
+                Resource: '*'
+              # S3: scoped to buckets this stack creates (name always starts with the stack name).
+              - Sid: S3ScopedToThisStack
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:PutBucketPolicy
+                  - s3:DeleteBucketPolicy
+                  - s3:GetBucketPolicy
+                  - s3:PutBucketAcl
+                  - s3:GetBucketAcl
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutLifecycleConfiguration
+                  - s3:GetLifecycleConfiguration
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:PutBucketTagging
+                  - s3:GetBucketTagging
+                Resource:
+                  - arn:aws:s3:::three-tier-app-network-*
+              # IAM: kept the tightest of all, since over-broad IAM permissions on a CI role is a
+              # privilege-escalation risk. Scoped to only the role/instance-profile names this stack creates.
+              - Sid: IamScopedToThisStacksRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:TagRole
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:GetInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:PassRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${EnvironmentName}-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:instance-profile/${EnvironmentName}-*
+
+  CloudWatchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${EnvironmentName}-dashboard
+      DashboardBody:
+        !Sub |
+          {
+            "widgets": [
+              {
+                "type": "metric",
+                "x": 0,
+                "y": 0,
+                "width": 12,
+                "height": 6,
+                "properties": {
+                  "title": "EC2 CPUUtilization (Auto Scaling Group)",
+                  "region": "${AWS::Region}",
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "period": 300,
+                  "metrics": [
+                    [ "AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${WebServerAutoScalingGroup}", { "stat": "Average", "label": "Average CPU %" } ]
+                  ]
+                }
+              },
+              {
+                "type": "metric",
+                "x": 12,
+                "y": 0,
+                "width": 12,
+                "height": 6,
+                "properties": {
+                  "title": "RDS CPUUtilization",
+                  "region": "${AWS::Region}",
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "period": 300,
+                  "metrics": [
+                    [ "AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${DBInstance}", { "stat": "Average", "label": "Average CPU %" } ]
+                  ]
+                }
+              },
+              {
+                "type": "metric",
+                "x": 0,
+                "y": 6,
+                "width": 24,
+                "height": 6,
+                "properties": {
+                  "title": "ALB RequestCount",
+                  "region": "${AWS::Region}",
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "period": 300,
+                  "metrics": [
+                    [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ApplicationLoadBalancer.LoadBalancerFullName}", { "stat": "Sum", "label": "Total Requests" } ]
+                  ]
+                }
+              }
+            ]
+          }
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub ${EnvironmentName}-vpc-id
+
+  PublicSubnetId:
+    Description: Public subnet ID
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub ${EnvironmentName}-public-subnet-id
+
+  PrivateSubnetId:
+    Description: Private subnet ID
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub ${EnvironmentName}-private-subnet-id
+
+  PublicRouteTableId:
+    Description: Public route table ID
+    Value: !Ref PublicRouteTable
+    Export:
+      Name: !Sub ${EnvironmentName}-public-rt-id
+
+  PrivateRouteTableId:
+    Description: Private route table ID
+    Value: !Ref PrivateRouteTable
+    Export:
+      Name: !Sub ${EnvironmentName}-private-rt-id
+
+  PublicSubnet2Id:
+    Description: Second public subnet ID (ALB and Auto Scaling Group)
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub ${EnvironmentName}-public-subnet-2-id
+
+  PrivateSubnet2Id:
+    Description: Second private subnet ID (DB subnet group only)
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub ${EnvironmentName}-private-subnet-2-id
+
+  DBSubnetGroupName:
+    Description: RDS DB subnet group name
+    Value: !Ref DBSubnetGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-db-subnet-group
+
+  DBSecurityGroupId:
+    Description: Security group ID for the RDS instance
+    Value: !Ref DBSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-db-sg-id
+
+  DBInstanceEndpoint:
+    Description: RDS instance connection endpoint
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-db-endpoint
+
+  DBInstancePort:
+    Description: RDS instance connection port
+    Value: !GetAtt DBInstance.Endpoint.Port
+    Export:
+      Name: !Sub ${EnvironmentName}-db-port
+
+  WebServerSecurityGroupId:
+    Description: Security group ID for the WordPress web servers
+    Value: !Ref WebServerSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-web-sg-id
+
+  ALBSecurityGroupId:
+    Description: Security group ID for the Application Load Balancer
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-alb-sg-id
+
+  LoadBalancerDNSName:
+    Description: Public DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  AutoScalingGroupName:
+    Description: Name of the WordPress Auto Scaling Group
+    Value: !Ref WebServerAutoScalingGroup
+
+  WordPressURL:
+    Description: URL to access the WordPress site
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+
+  EFSFileSystemId:
+    Description: EFS file system ID (mounted at /var/www/html/wp-content on every instance)
+    Value: !Ref EFSFileSystem
+    Export:
+      Name: !Sub ${EnvironmentName}-efs-id
+
+  EFSSecurityGroupId:
+    Description: Security group ID for the EFS mount targets
+    Value: !Ref EFSSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-efs-sg-id
+
+  CloudWatchDashboardURL:
+    Description: URL to the CloudWatch dashboard (EC2/RDS CPU, ALB request count)
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${CloudWatchDashboard}
+
+  ALBLogsBucketName:
+    Description: S3 bucket receiving ALB access logs
+    Value: !Ref ALBLogsBucket
+    Export:
+      Name: !Sub ${EnvironmentName}-alb-logs-bucket
+
+  HttpdErrorLogGroupName:
+    Description: CloudWatch Logs group receiving each instance's Apache error_log
+    Value: !Ref HttpdErrorLogGroup
+
+  CloudInitLogGroupName:
+    Description: CloudWatch Logs group receiving each instance's cloud-init-output.log (the UserData bootstrap script's output)
+    Value: !Ref CloudInitLogGroup
+
+  GitHubActionsDeployRoleArn:
+    Description: IAM role ARN GitHub Actions assumes via OIDC to deploy this stack
+    Value: !GetAtt GitHubActionsDeployRole.Arn
