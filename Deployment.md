@@ -554,6 +554,32 @@ WHERE um.meta_key = 'wp_capabilities';
 
 Every issue actually hit while building and operating this stack, with symptom → cause → fix. Check here first before re-diagnosing from scratch.
 
+### GitHub Actions OIDC: "Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity"
+
+- **Symptom**: The workflow's "Configure AWS credentials via OIDC" step retries `Assuming role with OIDC` for a couple of minutes, then fails with this exact message. The role, the OIDC provider, and the GitHub secret all "look" correctly configured.
+- **Cause**: GitHub's OIDC token `sub` claim format is `repo:<org>@<org-numeric-id>/<repo>@<repo-numeric-id>:ref:refs/heads/<branch>` — it embeds **immutable numeric IDs** alongside the org/repo names, not just `repo:<org>/<repo>:ref:refs/heads/<branch>`. A trust policy condition written with the simpler (older-looking, but actually just wrong) format silently never matches, and STS returns a generic "not authorized" with no hint about *why* — it doesn't tell you the actual `sub` value it received.
+- **How this was actually diagnosed**: The workflow logs don't show token contents (by design). CloudTrail does — it logs the denied `AssumeRoleWithWebIdentity` call, and the real presented `sub` claim shows up in `userIdentity.principalId`:
+  ```bash
+  aws cloudtrail lookup-events \
+    --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity \
+    --region us-east-1 --max-results 1 \
+    --query "Events[0].CloudTrailEvent" --output text | python3 -m json.tool
+  ```
+  Look at `userIdentity.principalId` in the result — that's the exact `sub` string GitHub sent, ground truth instead of guessing.
+- **Fix**: Get the real numeric IDs and put them in the trust policy (this template's `GitHubOrgId`/`GitHubRepoId` parameters):
+  ```bash
+  gh api users/<org> --jq '.id'
+  gh api repos/<org>/<repo> --jq '.id'
+  ```
+  Then redeploy with `GitHubOrgId`/`GitHubRepoId` set, so the condition becomes `repo:${GitHubOrg}@${GitHubOrgId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/heads/${GitHubBranch}`.
+
+### GitHub Actions deploy fails: "AccessDenied ... cloudformation:GetTemplateSummary"
+
+- **Symptom**: OIDC assume-role succeeds (progress — see the previous entry), but the very next step, `aws cloudformation deploy`, fails almost immediately with `User: .../GitHubActionsDeployRole/GitHubActions is not authorized to perform: cloudformation:GetTemplateSummary`.
+- **Cause**: `aws cloudformation deploy` isn't a single API call — it internally calls `GetTemplateSummary` (to inspect the template's parameters before building the change set) in addition to the change-set actions. It's easy to enumerate the "obvious" CloudFormation actions (`CreateChangeSet`, `ExecuteChangeSet`, `DescribeStacks`, etc.) when writing an IAM policy and miss this one, since it's not part of the change-set lifecycle itself.
+- **Fix**: Add `cloudformation:GetTemplateSummary` to the role's CloudFormation action list, scoped to the same stack ARN as the other CloudFormation actions.
+- **General lesson for this role's policy**: since AWS CLI's higher-level commands (`deploy`, and others) can call additional APIs beyond what their name suggests, expect to discover a missing permission or two the first time a new IAM policy is exercised for real, even after careful review. This is exactly what a working end-to-end test (an actual push through the actual workflow, not just re-reading the policy) is for.
+
 ### ALB update fails: "Access Denied for bucket ... Please check S3 bucket permission"
 
 - **Symptom**: `ApplicationLoadBalancer UPDATE_FAILED` (or `CREATE_FAILED`) with this message when enabling `access_logs.s3.enabled`.
@@ -688,7 +714,15 @@ See the dedicated "Gotcha: `LatestAmiId` doesn't auto-update just by editing the
 
 ### One-time AWS-side setup (already done for this stack)
 
-`GitHubActionsDeployRole` is defined in `cloudformation/vpc.yaml` itself, parameterized by `GitHubOrg`/`GitHubRepo`/`GitHubBranch` (defaults: `bdahiya2007` / this repo's name / `main`). It trusts the **existing** account-wide GitHub OIDC provider (`token.actions.githubusercontent.com`) — that provider is a one-per-AWS-account resource, so if your account already has one from another project, this template does not (and must not) try to create a duplicate; it only adds a new role that references the existing provider by ARN.
+`GitHubActionsDeployRole` is defined in `cloudformation/vpc.yaml` itself, parameterized by `GitHubOrg`/`GitHubOrgId`/`GitHubRepo`/`GitHubRepoId`/`GitHubBranch` (defaults: `bdahiya2007` / `5674538` / this repo's name / this repo's numeric ID / `main`). It trusts the **existing** account-wide GitHub OIDC provider (`token.actions.githubusercontent.com`) — that provider is a one-per-AWS-account resource, so if your account already has one from another project, this template does not (and must not) try to create a duplicate; it only adds a new role that references the existing provider by ARN.
+
+**`GitHubRepoId` has no default and must be supplied** — it's specific to whatever repo you're deploying from. Get it with:
+
+```bash
+gh api repos/<your-github-username>/<your-repo-name> --jq '.id'
+```
+
+(and `gh api users/<your-github-username> --jq '.id'` for `GitHubOrgId`, if different from the default above).
 
 Since a workflow can't assume a role that doesn't exist yet, this role has to be created by a manual, already-authenticated `deploy` at least once (chicken-and-egg — CI can't bootstrap its own trust relationship):
 
@@ -698,7 +732,7 @@ aws cloudformation deploy \
   --stack-name three-tier-app-network \
   --region us-east-1 \
   --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides GitHubRepo=<your-repo-name> DBPassword=<your-db-password> KeyPairName=<your-key-pair-name>
+  --parameter-overrides GitHubRepo=<your-repo-name> GitHubRepoId=<your-repo-id> DBPassword=<your-db-password> KeyPairName=<your-key-pair-name>
 ```
 
 After that, get the role's ARN from the stack output:
