@@ -234,6 +234,38 @@ aws rds modify-db-instance \
   --region us-east-1
 ```
 
+## Scale down/up for cost control when idle
+
+The Auto Scaling Group's `MinSize`/`DesiredCapacity` don't need to stay at their normal values (2) all the time — scale down to 1 instance when the site isn't actively being used, and back up to 2 when it is, to roughly halve the EC2 cost during idle periods.
+
+**Always scale via `aws cloudformation deploy`, never via `aws autoscaling update-auto-scaling-group` directly.** This project has a GitHub Actions workflow that runs `aws cloudformation deploy` on every push to `main` (see "Automated deployment via GitHub Actions"). CloudFormation tracks `AsgMinSize`/`AsgDesiredCapacity` as stack parameters; if you scale the ASG directly via the Auto Scaling API instead of through a CloudFormation deploy, CloudFormation doesn't know about that change — the *next* deploy (including one triggered by an unrelated doc-only push) will detect the drift and silently reset the ASG back to whatever CloudFormation still has on record, undoing your scale-down without any warning.
+
+**Scale down (idle, 1 instance):**
+
+```bash
+aws cloudformation deploy \
+  --template-file cloudformation/vpc.yaml \
+  --stack-name three-tier-app-network \
+  --region us-east-1 \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides AsgMinSize=1 AsgDesiredCapacity=1
+```
+
+**Scale back up (active use, normal 2):**
+
+```bash
+aws cloudformation deploy \
+  --template-file cloudformation/vpc.yaml \
+  --stack-name three-tier-app-network \
+  --region us-east-1 \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides AsgMinSize=2 AsgDesiredCapacity=2
+```
+
+Omitted parameters (`DBPassword`, `KeyPairName`, `GitHubRepo`, `GitHubRepoId`, etc.) reuse their current stored values automatically — no need to re-supply them just to change the ASG size. `AsgMaxSize` (default `3`) is left alone either way, so the group can still burst up under load even while scaled down to a 1-instance floor.
+
+Scaling down to 1 removes the multi-AZ redundancy that scaling to 2+ provides — acceptable for a deliberately idle period, not for normal operation. Scaling to `0` is also possible (maximum savings, but the ALB returns `503` to any visitor until scaled back up, and a scale-up from `0` means every instance is a cold boot — full `UserData` bootstrap, EFS mount, WordPress install — rather than most instances already being warm).
+
 ## Check stack status
 
 ```bash
