@@ -1,6 +1,6 @@
 # Deployment
 
-Commands for deploying the full CloudFormation stack for the three-tier web app: a VPC spanning two Availability Zones, CloudFront (with a dedicated WAF Web ACL — SQLi and XSS managed rules) in front of an Application Load Balancer + Auto Scaling Group (2-3 instances by default, the ALB restricted to CloudFront's IP ranges only) launching WordPress EC2 instances (Amazon Linux 2023, PHP 8.3, Apache) across two public subnets, a MySQL RDS primary plus a read replica in the second AZ (WordPress routes writes to the primary and reads to the replica via the HyperDB drop-in), an EFS file system mounted at `wp-content` on every instance so uploads/themes/plugins are shared across the group, a CloudWatch dashboard (EC2/RDS CPU, ALB request count), and logging (ALB access logs to S3, instance logs + RDS error log to CloudWatch Logs). Assumes AWS CLI v2 is installed and credentials are configured (`aws configure` or an active SSO/profile session) with permission to create VPC, RDS, EC2, ELBv2, EFS, IAM, S3, CloudWatch, CloudFront, WAF, and Auto Scaling resources.
+Commands for deploying the full CloudFormation stack for the three-tier web app: a VPC spanning two Availability Zones, CloudFront (custom domain `admin.securecloudengineers.com`, DNS-validated ACM certificate, with a dedicated WAF Web ACL — SQLi and XSS managed rules) in front of an Application Load Balancer + Auto Scaling Group (2-3 instances by default, the ALB restricted to CloudFront's IP ranges only) launching WordPress EC2 instances (Amazon Linux 2023, PHP 8.3, Apache) across two public subnets, a MySQL RDS primary plus a read replica in the second AZ (WordPress routes writes to the primary and reads to the replica via the HyperDB drop-in), an EFS file system mounted at `wp-content` on every instance so uploads/themes/plugins are shared across the group, a CloudWatch dashboard (EC2/RDS CPU, ALB request count), and logging (ALB access logs to S3, instance logs + RDS error log to CloudWatch Logs). Assumes AWS CLI v2 is installed and credentials are configured (`aws configure` or an active SSO/profile session) with permission to create VPC, RDS, EC2, ELBv2, EFS, IAM, S3, CloudWatch, CloudFront, WAF, ACM, Route 53, and Auto Scaling resources.
 
 **Every `deploy` command below needs `--capabilities CAPABILITY_NAMED_IAM`** — the stack creates a named IAM role (`CloudWatchAgentRole`, for the CloudWatch agent on each instance), and CloudFormation refuses to create/update IAM resources without this explicit acknowledgment. Omitting it fails with `Requires capabilities : [CAPABILITY_NAMED_IAM]`.
 
@@ -291,7 +291,7 @@ aws cloudformation describe-stacks \
   --query "Stacks[0].StackStatus"
 ```
 
-## View stack outputs (VPC ID, subnet IDs, route table IDs, RDS endpoint, ALB DNS name, CloudFront domain, WAF Web ACL ARN, EFS file system ID, CloudWatch dashboard URL, ALB logs bucket, log group names, WordPress URL)
+## View stack outputs (VPC ID, subnet IDs, route table IDs, RDS endpoint, ALB DNS name, CloudFront domain, custom domain certificate ARN, WAF Web ACL ARN, EFS file system ID, CloudWatch dashboard URL, ALB logs bucket, log group names, WordPress URL)
 
 ```bash
 aws cloudformation describe-stacks \
@@ -499,6 +499,16 @@ CloudFront sits in front of the ALB as the actual public entry point, with a ded
 
 **Cost added**: WAF has a flat ~$5/month Web ACL fee plus ~$1/month per rule group (2 here, ~$7/month total) plus a small per-million-requests charge; CloudFront itself is likely near-free at this project's traffic level (within or close to its own free tier for data transfer/requests). Brings the running total from the earlier ~$50-54/month estimate to roughly **$57-61/month**.
 
+### Custom domain (`admin.securecloudengineers.com`)
+
+`CustomDomainCertificate` is a DNS-validated ACM certificate for `CustomDomainName` (`admin.securecloudengineers.com` by default), created in `us-east-1` — a hard CloudFront requirement, regardless of which region the rest of the stack lives in. `DomainValidationOptions` with `HostedZoneId` lets CloudFormation create the validation CNAME itself and wait for issuance as part of the stack update; no manual console step, and no leftover validation record after a delete.
+
+`Route53HostedZoneId` (default `Z06930743HC9RLGHJO306`) points at the existing hosted zone for `securecloudengineers.com`, owned by a separate, independent stack (the `secure-static-website-aws` project, which already serves `www.securecloudengineers.com` from it). `CustomDomainDNSRecord`/`CustomDomainDNSRecordIPv6` add one new A/AAAA alias record into that zone for `admin.securecloudengineers.com` — a *new* record, not a modification of any of the zone's existing ones, so this doesn't have the cross-stack "whole list is authoritative" conflict that ruled out reusing that project's WAF Web ACL (see below): each `AWS::Route53::RecordSet` is its own independent resource, not a single list-valued property shared by every record in the zone.
+
+The distribution's `Aliases` and `ViewerCertificate` were updated to use this certificate instead of the CloudFront default (`*.cloudfront.net`) certificate — `WordPressURL` now points at the custom domain, and the default CloudFront domain (`CloudFrontDomainName` output) still works too, side by side.
+
+**After deploying**: same `wp_options` fix as below, but using the custom domain now, not the CloudFront domain — `siteurl`/`home` need to match whatever URL is actually being used to reach the site, or WordPress redirects to a stale one.
+
 ### Why not reuse the existing WAF Web ACL from the other portfolio project
 
 This account already has a Web ACL (`securecloudengineers-waf`) from the `secure-static-website-aws` repo. Deliberately not reused here:
@@ -535,7 +545,7 @@ inserted right after the "Add any custom values" marker in `wp-config.php`, so W
 
 ### After deploying: fix `wp_options` again
 
-Same issue as every previous change to the public entry point (see "WordPress login/internal links go to a dead URL" in Troubleshooting) — WordPress's `siteurl`/`home` database values still point at whatever URL was used during the last setup/fix, which is now stale (the ALB URL, not the CloudFront domain). Update them the same way as before, using the new `WordPressURL` (CloudFront) value:
+Same issue as every previous change to the public entry point (see "WordPress login/internal links go to a dead URL" in Troubleshooting) — WordPress's `siteurl`/`home` database values still point at whatever URL was used during the last setup/fix, which is now stale. Update them the same way as before, using the current `WordPressURL` output value (the custom domain now, once that's set up — see above):
 
 ```sql
 UPDATE wp_options SET option_value="<current-WordPressURL-output>" WHERE option_name IN ("siteurl","home");
@@ -794,6 +804,13 @@ Every issue actually hit while building and operating this stack, with symptom �
 - **Cause**: The stack includes a named IAM role (`CloudWatchAgentRole`, used by the CloudWatch agent on each instance). CloudFormation refuses to create or update any IAM resource unless you explicitly acknowledge that in the command.
 - **Fix**: Add `--capabilities CAPABILITY_NAMED_IAM` to the `deploy` command (every example in this file already includes it).
 
+### `ValidateTemplate`/`deploy` fails: template body exceeds the inline size limit
+
+- **Symptom**: `aws cloudformation validate-template` (or `deploy`, including in CI) fails with a `ValidationError` whose message oddly echoes back the *entire template body* as the "Value" that failed a constraint, rather than describing an actual template problem.
+- **Cause**: `TemplateBody` (used when passing a local file directly, as every command in this file and `deploy.yml` does — no S3 upload step) has a hard **51,200-byte** limit. This template sits close to that ceiling because of its (deliberately) thorough inline comments; it's easy to cross it with an otherwise-small, correct change; the error message doesn't mention size at all, so it looks like a validation failure on the content rather than a size limit on the parameter.
+- **Fix**: `wc -c cloudformation/vpc.yaml` to confirm; trim comment text (without losing the load-bearing "why," just tightening the wording) until back under the limit, ideally with some margin for the next change. The real fix for a template that's outgrown this permanently would be `--template-url` via an S3-uploaded copy (`aws cloudformation package`) instead of `--template-body`, but that adds a build step to `deploy.yml` that doesn't exist today — not worth it while trimming keeps working.
+- **General lesson**: this limit applies identically in CI (`deploy.yml` uses `--template-file`, which the CLI still sends as `TemplateBody` under this same limit) — a PR that passes `cfn-lint` cleanly can still fail at deploy time on `push` to `main` for a reason `cfn-lint` has no way to catch, since it's an API-level constraint, not a template-correctness one.
+
 ### PR checks stop running / stuck `pending` forever
 
 - **Symptom**: after pushing a new commit to a PR's branch, the `validate` check never starts (or the previous commit's result just sits there, no new run appears at all — `gh run list` shows nothing for the new commit's SHA).
@@ -1012,7 +1029,8 @@ No AWS access key/secret key secrets exist at all with this approach — a role 
 
 Scoped deliberately, not a broad managed policy:
 - **CloudFormation** actions restricted to this one stack's ARN (`stack/three-tier-app-network/*`); `ValidateTemplate` is separate since that action has no resource-level permission support.
-- **EC2, Auto Scaling, RDS, ELBv2, EFS, Logs, CloudWatch, Lambda, SSM, CloudFront, WAFv2**: action list scoped to only what a deploy needs (not `service:*` wildcards, except where AWS groups related actions like `autoscaling:*`/`rds:*`/`elasticfilesystem:*`/`cloudfront:*`/`wafv2:*` themselves) — but on `Resource: "*"`, since most of these create/describe/modify actions genuinely don't support resource-level ARN restriction in AWS's own IAM implementation (a documented AWS limitation, not a shortcut here).
+- **EC2, Auto Scaling, RDS, ELBv2, EFS, Logs, CloudWatch, Lambda, SSM, CloudFront, WAFv2, ACM**: action list scoped to only what a deploy needs (not `service:*` wildcards, except where AWS groups related actions like `autoscaling:*`/`rds:*`/`elasticfilesystem:*`/`cloudfront:*`/`wafv2:*`/`acm:*` themselves) — but on `Resource: "*"`, since most of these create/describe/modify actions genuinely don't support resource-level ARN restriction in AWS's own IAM implementation (a documented AWS limitation, not a shortcut here). ACM specifically has no such restriction to apply anyway: a certificate's ARN doesn't exist yet at policy-write time, and DNS-validated certs are typically single-use per domain.
+- **Route 53**: restricted to the one hosted zone this stack adds a record into (`arn:aws:route53:::hostedzone/<id>`), not `route53:*` on every zone in the account — unlike most of the list above, Route 53 record actions genuinely do support resource-level ARN restriction, so there was no reason not to use it. `route53:GetChange` is the one exception (`Resource: "*"`) since change IDs aren't scoped to a zone.
 - **S3**: restricted to bucket names starting with `three-tier-app-network-` (this stack's naming convention for the ALB logs bucket).
 - **IAM**: the tightest of all, since over-broad IAM permissions on a CI role is a privilege-escalation risk — restricted to role/instance-profile ARNs starting with `three-tier-app-` (this stack's own resources only, including the role itself, so future deploys can still update its own permissions).
 
