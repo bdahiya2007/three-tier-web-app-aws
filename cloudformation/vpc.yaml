@@ -522,13 +522,15 @@ Resources:
 
   WebServerLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
+    # DBInstance, DBReadReplica, HttpdErrorLogGroup, and CloudInitLogGroup are
+    # deliberately not listed here: their dependency is already enforced implicitly
+    # by the Ref/GetAtt usages inside UserData below (cfn-lint W3005) - an explicit
+    # DependsOn on them would be redundant. EFSMountTarget1/2 are NOT referenced
+    # anywhere in UserData (only EFSFileSystem is), so they still need to be listed
+    # explicitly.
     DependsOn:
-      - DBInstance
-      - DBReadReplica
       - EFSMountTarget1
       - EFSMountTarget2
-      - HttpdErrorLogGroup
-      - CloudInitLogGroup
     Properties:
       LaunchTemplateName: !Sub ${EnvironmentName}-wordpress-lt
       LaunchTemplateData:
@@ -670,6 +672,16 @@ Resources:
     Type: AWS::RDS::DBInstance
     DeletionPolicy: Snapshot
     UpdateReplacePolicy: Snapshot
+    # cfn-lint W1011 (use a Secrets Manager dynamic reference instead of a plain
+    # NoEcho parameter for MasterUserPassword) is deliberately suppressed here:
+    # for this project's scale (one password, one CI workflow consumer), Secrets
+    # Manager's ~$0.40/month per secret buys audit trail and rotation neither of
+    # which are needed yet - a deliberate cost/security tradeoff, not an oversight.
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1011
     Properties:
       DBName: !If [RestoreFromSnapshot, !Ref 'AWS::NoValue', !Ref DBName]
       Engine: mysql
@@ -696,7 +708,8 @@ Resources:
 
   DBReadReplica:
     Type: AWS::RDS::DBInstance
-    DependsOn: DBInstance
+    # No explicit DependsOn: DBInstance - already enforced implicitly by
+    # !Ref DBInstance in SourceDBInstanceIdentifier below (cfn-lint W3005).
     Properties:
       SourceDBInstanceIdentifier: !Ref DBInstance
       DBInstanceClass: !Ref DBInstanceClass
@@ -786,7 +799,8 @@ Resources:
 
   DBErrorLogRetention:
     Type: Custom::SetRdsLogRetention
-    DependsOn: DBInstance
+    # No explicit DependsOn: DBInstance - already enforced implicitly by the
+    # !Ref DBInstance in LogGroupName below (cfn-lint W3005).
     Properties:
       ServiceToken: !GetAtt RdsLogRetentionFunction.Arn
       LogGroupName: !Sub /aws/rds/instance/${DBInstance}/error
