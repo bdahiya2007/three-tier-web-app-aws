@@ -1,6 +1,6 @@
 # Deployment
 
-Commands for deploying the full CloudFormation stack for the three-tier web app: a VPC spanning two Availability Zones, CloudFront (custom domain `admin.securecloudengineers.com`, DNS-validated ACM certificate, with a dedicated WAF Web ACL — SQLi and XSS managed rules) in front of an Application Load Balancer + Auto Scaling Group (2-3 instances by default, the ALB restricted to CloudFront's IP ranges only) launching WordPress EC2 instances (Amazon Linux 2023, PHP 8.3, Apache) across two public subnets, a MySQL RDS primary plus a read replica in the second AZ (WordPress routes writes to the primary and reads to the replica via the HyperDB drop-in), a single-node ElastiCache Redis cluster used as WordPress's object cache to reduce database load, an EFS file system mounted at `wp-content` on every instance so uploads/themes/plugins are shared across the group, a CloudWatch dashboard (EC2/RDS CPU, ALB request count), and logging (ALB access logs to S3, instance logs + RDS error log to CloudWatch Logs). Assumes AWS CLI v2 is installed and credentials are configured (`aws configure` or an active SSO/profile session) with permission to create VPC, RDS, EC2, ELBv2, EFS, ElastiCache, IAM, S3, CloudWatch, CloudFront, WAF, ACM, Route 53, and Auto Scaling resources.
+Commands for deploying the full CloudFormation stack for the three-tier web app: a VPC spanning two Availability Zones, CloudFront (custom domain `admin.securecloudengineers.com`, DNS-validated ACM certificate, with a dedicated WAF Web ACL — SQLi and XSS managed rules) in front of an Application Load Balancer + Auto Scaling Group (2-3 instances by default, the ALB restricted to CloudFront's IP ranges only) launching WordPress EC2 instances (Amazon Linux 2023, PHP 8.3, Apache) across two public subnets, a MySQL RDS primary plus a read replica in the second AZ (WordPress routes writes to the primary and reads to the replica via the HyperDB drop-in), a single-node ElastiCache Redis cluster used as WordPress's object cache to reduce database load, an EFS file system mounted at `wp-content` on every instance so uploads/themes/plugins are shared across the group, a daily AWS Backup plan (30-day retention) covering RDS, EFS, and the EC2 web tier, a CloudWatch dashboard (EC2/RDS CPU, ALB request count), and logging (ALB access logs to S3, instance logs + RDS error log to CloudWatch Logs). Assumes AWS CLI v2 is installed and credentials are configured (`aws configure` or an active SSO/profile session) with permission to create VPC, RDS, EC2, ELBv2, EFS, ElastiCache, AWS Backup, IAM, S3, CloudWatch, CloudFront, WAF, ACM, Route 53, and Auto Scaling resources.
 
 **Every `deploy` command below needs `--capabilities CAPABILITY_NAMED_IAM`** — the stack creates a named IAM role (`CloudWatchAgentRole`, for the CloudWatch agent on each instance), and CloudFormation refuses to create/update IAM resources without this explicit acknowledgment. Omitting it fails with `Requires capabilities : [CAPABILITY_NAMED_IAM]`.
 
@@ -291,7 +291,7 @@ aws cloudformation describe-stacks \
   --query "Stacks[0].StackStatus"
 ```
 
-## View stack outputs (VPC ID, subnet IDs, route table IDs, RDS endpoint, Redis endpoint, ALB DNS name, CloudFront domain, custom domain certificate ARN, WAF Web ACL ARN, EFS file system ID, CloudWatch dashboard URL, ALB logs bucket, log group names, WordPress URL)
+## View stack outputs (VPC ID, subnet IDs, route table IDs, RDS endpoint, Redis endpoint, ALB DNS name, CloudFront domain, custom domain certificate ARN, WAF Web ACL ARN, EFS file system ID, backup vault/plan, CloudWatch dashboard URL, ALB logs bucket, log group names, WordPress URL)
 
 ```bash
 aws cloudformation describe-stacks \
@@ -794,6 +794,43 @@ The Redis Object Cache plugin is documented to catch connection failures and fal
 
 Same rule as the read replica above: a stack update alone doesn't touch already-running instances. Run an instance refresh to roll out the extension, plugin drop-in, and `wp-config.php` changes to instances that existed before this feature was added.
 
+## AWS Backup
+
+`BackupVault` is a dedicated vault; `BackupPlan` runs one rule (`Daily`) on a cron schedule (`BackupScheduleExpression`, default `cron(0 5 * * ? *)` — 05:00 UTC daily) with a 30-day retention (`BackupRetentionDays`) before AWS Backup deletes each recovery point. `BackupServiceRole` is the service role AWS Backup assumes to actually create backups, using the AWS-managed `AWSBackupServiceRolePolicyForBackup` policy.
+
+`BackupSelection` decides what gets backed up, and uses two different mechanisms deliberately:
+- **RDS (`DBInstance`) and EFS (`EFSFileSystem`) by explicit ARN** (`!GetAtt ...Arn`) — each is a single, known resource, so there's nothing to gain from tag-based matching.
+- **EC2 by tag** (`Name` = `${EnvironmentName}-wordpress`, the tag the Auto Scaling Group already propagates to every instance at launch) — instances get replaced by the ASG over time, so a static instance ID/ARN would silently stop covering new instances. Tag-based selection keeps working automatically as instances come and go.
+
+`DBReadReplica` is deliberately **not** included. It's derived entirely from the primary via replication — restoring it independently doesn't make sense; recovering the primary and re-creating a replica from it does.
+
+**Relationship to RDS's own automated backups** (`DBBackupRetentionPeriod`): these are complementary, not redundant. RDS's built-in backups exist for short-window point-in-time recovery (its own storage, its own lifecycle, capped at `DBBackupRetentionPeriod` days). This AWS Backup plan is a separate, centralized, longer-retention (30 days) mechanism spanning RDS *and* EFS *and* EC2 in one named vault — useful for a broader disaster-recovery/compliance story, not a replacement for RDS's short-term PITR window.
+
+**Cost added**: billed per-resource, verified via `aws pricing get-products` rather than guessed — RDS backup storage is $0.095/GB-month (but RDS grants a free backup storage allowance equal to total provisioned RDS storage across the account, so this may cost nothing until snapshots collectively exceed that), EFS backup storage is $0.05/GB-month, EC2 (AMI/EBS snapshot) backup storage is $0.05/GB-month. RDS snapshots are incremental after the first, so actual monthly cost depends on how much data actually changes day to day — not something to estimate confidently in advance; check Cost Explorer under "AWS Backup" after the 30-day retention window has fully filled once.
+
+### Verify it's actually working, not just scheduled
+
+Same principle as everywhere else in this file — a `BackupPlan` resource existing doesn't prove a backup can actually complete (wrong IAM permissions, an unreachable resource, or a bad ARN in the selection would all deploy cleanly and then silently fail on the first scheduled run, hours or days later). Trigger an on-demand job instead of waiting for the schedule:
+
+```bash
+aws backup start-backup-job \
+  --backup-vault-name <vault-name> \
+  --resource-arn <resource-arn> \
+  --iam-role-arn <backup-role-arn> \
+  --region us-east-1
+
+# poll:
+aws backup describe-backup-job --backup-job-id <job-id> --region us-east-1 --query "[State,StatusMessage,BackupSizeInBytes]"
+```
+
+Live result from this exact test: an on-demand EFS backup completed in well under a minute (`BackupSizeInBytes: 16353060`, ~15.6 MB), and an on-demand RDS backup also completed (`COMPLETED`) — both landing as recovery points in the vault (`aws backup list-recovery-points-by-backup-vault --backup-vault-name <vault-name>`), not just accepted-and-forgotten jobs.
+
+**RDS-specific gotcha**: the RDS recovery point reported `BackupSizeInBytes: 0` even though its status was `COMPLETED` — this looked like a false success at first. Checked the actual underlying snapshot AWS Backup created (`aws rds describe-db-snapshots --snapshot-type awsbackup`) and found it genuinely `available` at 100% progress with the DB's full 20 GiB allocated storage — a real, complete snapshot. AWS Backup's own size reporting for RDS-type recovery points is known to lag or not populate; `COMPLETED` status plus a direct check against the underlying RDS snapshot is the reliable way to confirm an RDS backup actually worked, not the `BackupSizeInBytes` field.
+
+### Restoring from a recovery point
+
+Not exercised end-to-end here (would mean actually restoring over live infrastructure), but the mechanism: `aws backup start-restore-job --recovery-point-arn <arn> --iam-role-arn <backup-role-arn> --metadata <resource-specific-metadata> --region us-east-1`. RDS and EFS restores create a **new** resource (a new DB instance, a new file system) rather than overwriting the original in place — the same principle as the RDS snapshot-restore path already documented above, and worth remembering before assuming "restore" means "revert this exact resource."
+
 ## Troubleshooting
 
 Every issue actually hit while building and operating this stack, with symptom → cause → fix. Check here first before re-diagnosing from scratch.
@@ -1084,7 +1121,7 @@ No AWS access key/secret key secrets exist at all with this approach — a role 
 
 Scoped deliberately, not a broad managed policy:
 - **CloudFormation** actions restricted to this one stack's ARN (`stack/three-tier-app-network/*`); `ValidateTemplate` is separate since that action has no resource-level permission support.
-- **EC2, Auto Scaling, RDS, ELBv2, EFS, ElastiCache, Logs, CloudWatch, Lambda, SSM, CloudFront, WAFv2, ACM**: action list scoped to only what a deploy needs (not `service:*` wildcards, except where AWS groups related actions like `autoscaling:*`/`rds:*`/`elasticfilesystem:*`/`elasticache:*`/`cloudfront:*`/`wafv2:*`/`acm:*` themselves) — but on `Resource: "*"`, since most of these create/describe/modify actions genuinely don't support resource-level ARN restriction in AWS's own IAM implementation (a documented AWS limitation, not a shortcut here). ACM specifically has no such restriction to apply anyway: a certificate's ARN doesn't exist yet at policy-write time, and DNS-validated certs are typically single-use per domain.
+- **EC2, Auto Scaling, RDS, ELBv2, EFS, ElastiCache, AWS Backup, Logs, CloudWatch, Lambda, SSM, CloudFront, WAFv2, ACM**: action list scoped to only what a deploy needs (not `service:*` wildcards, except where AWS groups related actions like `autoscaling:*`/`rds:*`/`elasticfilesystem:*`/`elasticache:*`/`backup:*`/`cloudfront:*`/`wafv2:*`/`acm:*` themselves) — but on `Resource: "*"`, since most of these create/describe/modify actions genuinely don't support resource-level ARN restriction in AWS's own IAM implementation (a documented AWS limitation, not a shortcut here). ACM specifically has no such restriction to apply anyway: a certificate's ARN doesn't exist yet at policy-write time, and DNS-validated certs are typically single-use per domain.
 - **Route 53**: restricted to the one hosted zone this stack adds a record into (`arn:aws:route53:::hostedzone/<id>`), not `route53:*` on every zone in the account — unlike most of the list above, Route 53 record actions genuinely do support resource-level ARN restriction, so there was no reason not to use it. `route53:GetChange` is the one exception (`Resource: "*"`) since change IDs aren't scoped to a zone.
 - **S3**: restricted to bucket names starting with `three-tier-app-network-` (this stack's naming convention for the ALB logs bucket).
 - **IAM**: the tightest of all, since over-broad IAM permissions on a CI role is a privilege-escalation risk — restricted to role/instance-profile ARNs starting with `three-tier-app-` (this stack's own resources only, including the role itself, so future deploys can still update its own permissions).
