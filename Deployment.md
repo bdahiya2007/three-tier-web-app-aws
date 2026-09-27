@@ -1,6 +1,6 @@
 # Deployment
 
-Commands for deploying the full CloudFormation stack for the three-tier web app: a VPC spanning two Availability Zones, a MySQL RDS instance in the private subnet(s), an Application Load Balancer + Auto Scaling Group (2-3 instances by default) launching WordPress EC2 instances (Amazon Linux 2023, PHP 8.3, Apache) across two public subnets, an EFS file system mounted at `wp-content` on every instance so uploads/themes/plugins are shared across the group, a CloudWatch dashboard (EC2/RDS CPU, ALB request count), and logging (ALB access logs to S3, instance logs + RDS error log to CloudWatch Logs). Assumes AWS CLI v2 is installed and credentials are configured (`aws configure` or an active SSO/profile session) with permission to create VPC, RDS, EC2, ELBv2, EFS, IAM, S3, CloudWatch, and Auto Scaling resources.
+Commands for deploying the full CloudFormation stack for the three-tier web app: a VPC spanning two Availability Zones, a MySQL RDS primary plus a read replica in the second AZ (WordPress routes writes to the primary and reads to the replica via the HyperDB drop-in), an Application Load Balancer + Auto Scaling Group (2-3 instances by default) launching WordPress EC2 instances (Amazon Linux 2023, PHP 8.3, Apache) across two public subnets, an EFS file system mounted at `wp-content` on every instance so uploads/themes/plugins are shared across the group, a CloudWatch dashboard (EC2/RDS CPU, ALB request count), and logging (ALB access logs to S3, instance logs + RDS error log to CloudWatch Logs). Assumes AWS CLI v2 is installed and credentials are configured (`aws configure` or an active SSO/profile session) with permission to create VPC, RDS, EC2, ELBv2, EFS, IAM, S3, CloudWatch, and Auto Scaling resources.
 
 **Every `deploy` command below needs `--capabilities CAPABILITY_NAMED_IAM`** — the stack creates a named IAM role (`CloudWatchAgentRole`, for the CloudWatch agent on each instance), and CloudFormation refuses to create/update IAM resources without this explicit acknowledgment. Omitting it fails with `Requires capabilities : [CAPABILITY_NAMED_IAM]`.
 
@@ -11,6 +11,22 @@ If your account is on the RDS free tier, `DBBackupRetentionPeriod` must stay at 
 `KeyPairName` also has no default and must reference an EC2 key pair that already exists in `us-east-1` (see "Create a key pair" below).
 
 `SSHLocationCidr` defaults to `0.0.0.0/0` (open to the internet). Restrict it to your own IP for anything beyond a quick test, e.g. `--parameter-overrides SSHLocationCidr=$(curl -s ifconfig.me)/32 ...`.
+
+## Git workflow: branch, PR, merge — never push directly to `main`
+
+All changes go through a feature branch and a pull request; nothing gets pushed or merged directly to `main`. Since `main` is what the GitHub Actions workflow deploys on every push, this gives every change a review point before it can reach live infrastructure.
+
+```bash
+git checkout main && git pull origin main
+git checkout -b feature/<short-description>
+# ... make changes, commit ...
+git push -u origin feature/<short-description>
+gh pr create --base main --head feature/<short-description> --title "..." --body "..."
+```
+
+Then merge the PR from GitHub's UI (or `gh pr merge <number>`) once it's reviewed — that merge is what triggers the actual deploy via CI.
+
+**Keep feature branches short-lived.** If two branches sit open in parallel and both touch the same lines of `cloudformation/vpc.yaml`, merging the first one makes the second one conflict — an ordinary git conflict, not a CI problem (see "PR checks stop running / stuck pending" in Troubleshooting for the specific way this shows up with the `pull_request`-triggered lint job). Rebase onto the latest `main` before starting new work if another PR might land first, and merge promptly rather than letting several accumulate.
 
 ## Create a key pair
 
@@ -582,6 +598,33 @@ JOIN wp_usermeta um ON u.ID = um.user_id
 WHERE um.meta_key = 'wp_capabilities';
 ```
 
+## RDS read replica and WordPress read/write splitting
+
+`DBReadReplica` is a MySQL read replica of `DBInstance`, placed explicitly in `SecondAvailabilityZone` (a different AZ than the primary) via `AvailabilityZone: !Ref SecondAvailabilityZone`. WordPress core has no native concept of a read replica — all queries go to whatever's in `DB_HOST` in `wp-config.php`. To actually split reads/writes, `UserData` installs [HyperDB](https://wordpress.org/plugins/hyperdb/) (Automattic's drop-in for this) after WordPress core is in place:
+
+1. Downloads and extracts the HyperDB plugin, copies `db.php` into `wp-content/db.php` — WordPress auto-loads this file if present, and it takes over all database access from the built-in `wpdb` class.
+2. Generates `db-config.php` in the webroot (`/var/www/html`, alongside `wp-config.php`, not inside `wp-content`) with two server entries: the primary (`'write' => 1, 'read' => 0`) and the replica (`'write' => 0, 'read' => 1`), both in HyperDB's default `'global'` dataset.
+
+Since `wp-content` is EFS-mounted, `db.php` ends up on the **shared** filesystem (same file visible from every instance); `db-config.php` is written locally by each instance's own `UserData` run (deterministic content from the same CloudFormation parameters every time, so no need to share it via EFS).
+
+### Verify it's actually working
+
+```bash
+# on any instance:
+cat /var/www/html/wp-content/db.php | head -5          # confirms the HyperDB drop-in is in place
+cat /var/www/html/db-config.php                          # confirms both hosts are configured correctly
+```
+
+If `db.php` is missing, WordPress silently falls back to its built-in single-connection `wpdb` (talking only to whatever `DB_HOST` is in `wp-config.php`, i.e. the primary) — the site still works, it just isn't actually using the replica for anything. There's no error in this failure mode, so checking the file is the only way to confirm HyperDB is actually active, not just configured in principle.
+
+### Known limitation: replication lag
+
+Read replicas are asynchronous — there's a small delay between a write landing on the primary and it becoming visible on the replica. HyperDB's simple two-server config here doesn't implement "read-your-own-writes" handling (e.g. temporarily routing reads to the primary for the rest of a request right after that same request performed a write). In practice this means: publishing a post and immediately being redirected to view it could, in rare cases under load, briefly show stale data if that view's read lands on the replica before replication catches up. For a portfolio-scale demo this is a non-issue (lag is typically sub-second, single low-traffic site), but it's a real production consideration HyperDB supports handling more robustly (via its `dataset`/callback mechanism) that this simple config doesn't use.
+
+### After adding/changing anything replica-related
+
+Same rule as any other `UserData` change: a stack update alone doesn't touch already-running instances. Run an instance refresh (see "Update running instances after a launch template change" above) to actually roll out `db.php`/`db-config.php` to instances that existed before this feature was added.
+
 ## Troubleshooting
 
 Every issue actually hit while building and operating this stack, with symptom → cause → fix. Check here first before re-diagnosing from scratch.
@@ -623,6 +666,19 @@ Every issue actually hit while building and operating this stack, with symptom �
 - **Symptom**: `aws cloudformation deploy` fails immediately (no change set / stack event even created) with this message.
 - **Cause**: The stack includes a named IAM role (`CloudWatchAgentRole`, used by the CloudWatch agent on each instance). CloudFormation refuses to create or update any IAM resource unless you explicitly acknowledge that in the command.
 - **Fix**: Add `--capabilities CAPABILITY_NAMED_IAM` to the `deploy` command (every example in this file already includes it).
+
+### PR checks stop running / stuck `pending` forever
+
+- **Symptom**: after pushing a new commit to a PR's branch, the `validate` check never starts (or the previous commit's result just sits there, no new run appears at all — `gh run list` shows nothing for the new commit's SHA).
+- **Cause**: the PR is in a `DIRTY`/`CONFLICTING` merge state relative to `main` (check with `gh pr view <number> --json mergeable,mergeStateStatus`). GitHub doesn't reliably fire `pull_request` check runs against a PR that can't currently be merged — this happens most often when two branches were both open at once and one of them merged first, leaving the other's diff colliding with the new `main`. It looks exactly like a CI/workflow bug from the outside (no error, just silence), but it isn't one.
+- **Fix**: resolve the conflict — `git fetch origin main && git rebase origin/main`, resolve any conflict markers, `git push --force-with-lease` (safe on your own feature branch, not on `main`). Once `mergeable` flips back to `MERGEABLE`, checks start firing normally again on the very next push, with no other change needed.
+- **General lesson**: keep feature branches short-lived and rebase before starting new work if another PR might land first (see "Git workflow" above) — this class of conflict is much rarer the fewer long-lived parallel branches exist touching the same files.
+
+### cfn-lint W3005 / W1011 findings on pull requests
+
+- **W3005** ("`'<X>'` dependency already enforced by a `'Ref'`/`'GetAtt'` at ...") fires whenever a resource has both an explicit `DependsOn` entry *and* a `Ref`/`Fn::GetAtt` reference to that same resource elsewhere in its properties (or, for `WebServerLaunchTemplate`, inside its `UserData` string) — the explicit entry is redundant, since CloudFormation already infers the dependency from the reference. Hit this repeatedly (`DBInstance`, `DBReadReplica`, `HttpdErrorLogGroup`, `CloudInitLogGroup` in various resources' `DependsOn` lists) — the fix each time was simply removing the redundant entry, not adding a suppression. Only keep an explicit `DependsOn` for a resource that's genuinely *not* referenced anywhere in that resource's properties (e.g. `EFSMountTarget1`/`EFSMountTarget2` on `WebServerLaunchTemplate` — nothing in `UserData` references them directly, only `EFSFileSystem`, so their dependency has to stay explicit).
+- **W1011** ("Use dynamic references over parameters for secrets") fires on `MasterUserPassword: !Ref DBPassword` in `DBInstance`, suggesting an AWS Secrets Manager dynamic reference instead of a plain `NoEcho` parameter. This one is **deliberately suppressed** (via a per-resource `Metadata: cfn-lint: config: ignore_checks: [W1011]` block on `DBInstance`), not fixed — see the cost/complexity discussion earlier in this file about why GitHub Secrets was chosen over Secrets Manager for this project's scale. Don't "fix" this by actually migrating to Secrets Manager without re-deciding that tradeoff first; the suppression exists precisely because the finding is correct advice being knowingly not taken here.
+- **Exit codes**: `cfn-lint` returns non-zero for warnings, not just errors — a bare `cfn-lint template.yaml` failing doesn't necessarily mean anything is actually broken, just that it found something to flag. Read the actual finding before assuming the template is wrong.
 
 ### Why does the RDS error log group need a custom resource for retention?
 
@@ -742,7 +798,14 @@ See the dedicated "Gotcha: `LatestAmiId` doesn't auto-update just by editing the
 
 ## Automated deployment via GitHub Actions
 
-[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) deploys the stack automatically on every push to `main`. Authentication uses **GitHub OIDC** — no long-lived AWS access keys stored anywhere in this repo. GitHub Actions requests a short-lived identity token and assumes `GitHubActionsDeployRole` directly; AWS trusts the request only because that role's trust policy checks the token's `sub` claim against this exact repo and branch.
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) has two jobs, split by trigger:
+
+- **`validate`** — runs on every pull request targeting `main`. Lints `cloudformation/vpc.yaml` with `cfn-lint`. No AWS credentials involved at all.
+- **`deploy`** — runs on push to `main` (i.e. after a PR merges). Deploys the stack via GitHub OIDC.
+
+Authentication for the `deploy` job uses **GitHub OIDC** — no long-lived AWS access keys stored anywhere in this repo. GitHub Actions requests a short-lived identity token and assumes `GitHubActionsDeployRole` directly; AWS trusts the request only because that role's trust policy checks the token's `sub` claim against this exact repo and branch.
+
+**Why `validate` doesn't also use OIDC**: a `pull_request`-triggered OIDC token has a different `sub` claim shape than a `push`-triggered one (`repo:<org>/<repo>:pull_request` vs. `repo:<org>@<id>/<repo>@<id>:ref:refs/heads/main`), which `GitHubActionsDeployRole`'s trust policy deliberately doesn't authorize. Rather than widen that trust policy to also cover PR runs — which would mean any PR, in principle, could carry AWS credentials capable of deploying this stack — `validate` uses `cfn-lint` instead, which needs no cloud credentials at all. Safer default for a repo that takes PRs.
 
 ### One-time AWS-side setup (already done for this stack)
 
@@ -797,11 +860,19 @@ Scoped deliberately, not a broad managed policy:
 - **S3**: restricted to bucket names starting with `three-tier-app-network-` (this stack's naming convention for the ALB logs bucket).
 - **IAM**: the tightest of all, since over-broad IAM permissions on a CI role is a privilege-escalation risk — restricted to role/instance-profile ARNs starting with `three-tier-app-` (this stack's own resources only, including the role itself, so future deploys can still update its own permissions).
 
-### What the workflow does
+### What the `validate` job does (pull requests)
+
+1. Checks out the repo.
+2. Installs `cfn-lint` (Python, via `pip`).
+3. Runs `cfn-lint cloudformation/vpc.yaml`.
+
+No AWS credentials, no `deploy` step — this job's only purpose is to catch template-level mistakes before merge. `cfn-lint`'s exit code is non-zero for warnings too, not just errors, so it fails the check on `W`-level findings — see "cfn-lint W3005 / W1011 findings" in Troubleshooting for the two patterns already hit and how they were resolved.
+
+### What the `deploy` job does (push to `main`)
 
 1. Checks out the repo.
 2. Requests a GitHub OIDC token and assumes `AWS_DEPLOY_ROLE_ARN` (`aws-actions/configure-aws-credentials`, `role-to-assume` instead of static keys) — requires the job-level `permissions: id-token: write`.
-3. Runs `aws cloudformation validate-template` (fails fast on a syntax error before touching any real resources).
+3. Runs `aws cloudformation validate-template` (fails fast on a syntax error before touching any real resources — a second, AWS-API-based check on top of what `cfn-lint` already did in the PR).
 4. Runs `aws cloudformation deploy` with `DBPassword`/`KeyPairName` from secrets — every other parameter is omitted, so CloudFormation reuses the stack's current values for them (same "reuse previous value" behavior as the manual `deploy` commands throughout this file).
 5. Prints the stack outputs.
 
@@ -809,7 +880,7 @@ Scoped deliberately, not a broad managed policy:
 
 ### Limitations / things to know before relying on this for anything beyond a portfolio project
 
-- **No change-set review step** — unlike the manual workflow documented above (create → review → execute), this deploys directly on every push with no human review gate. Fine for solo/learning use; for a team, add a required PR review before merge to `main`, or switch this workflow to trigger on a tag/manual `workflow_dispatch` instead of every push.
+- **The PR review gate lives in process, not in the workflow itself** — `deploy` still runs unconditionally on every push to `main`, with no approval step inside the workflow. What actually gates it is the branch/PR policy above (nothing reaches `main` without a merged PR) plus the `validate` job's lint check — not a `deploy`-side confirmation step. A merge is what triggers a real deploy; treat it that way.
 - **No snapshot-restore or first-time-create handling** — this workflow assumes the stack already exists and is doing routine updates. The snapshot-restore parameters (`DBSnapshotIdentifier`, etc.) aren't wired into it; run that manually per the "Deploy restoring the database from a snapshot" section if ever needed.
 - **No instance refresh** — per "Update running instances after a launch template change" above, a stack update alone doesn't replace already-running EC2 instances. This workflow doesn't trigger one automatically; if a change needs it (AMI, `UserData`, IAM instance profile, etc.), run `aws autoscaling start-instance-refresh` manually afterward.
 - **The trust policy is branch-specific** — only pushes on `refs/heads/main` (via `GitHubBranch`, default `main`) can assume this role. A workflow run from a different branch, a fork, or a pull_request-triggered event (different `sub` claim shape) will get `AccessDenied` on the OIDC assume-role step, by design.
