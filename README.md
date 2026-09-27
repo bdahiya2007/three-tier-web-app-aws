@@ -2,7 +2,7 @@
 
 [![Deploy CloudFormation Stack](https://github.com/bdahiya2007/three-tier-web-app-aws/actions/workflows/deploy.yml/badge.svg)](https://github.com/bdahiya2007/three-tier-web-app-aws/actions/workflows/deploy.yml)
 
-A production-style three-tier web architecture on AWS — WordPress running behind CloudFront (on a custom domain, `admin.securecloudengineers.com`, with a DNS-validated ACM certificate) and a dedicated WAF Web ACL, on a horizontally-scaled, self-healing web tier that isn't even reachable except through that edge layer, backed by a database that's never directly reachable and splits reads across a cross-AZ read replica, with shared state, full observability, a CI/CD pipeline authenticated via GitHub OIDC (no long-lived AWS credentials), and a documented security review. Not persistently hosted — a public WordPress admin login isn't something worth leaving exposed indefinitely for a demo. Deployable on demand; see [Deploying this yourself](#deploying-this-yourself).
+A production-style three-tier web architecture on AWS — WordPress running behind CloudFront (on a custom domain, `admin.securecloudengineers.com`, with a DNS-validated ACM certificate) and a dedicated WAF Web ACL, on a horizontally-scaled, self-healing web tier that isn't even reachable except through that edge layer, backed by a database that's never directly reachable, splits reads across a cross-AZ read replica, and is shielded from repeat reads by a Redis object cache, with shared state, full observability, a CI/CD pipeline authenticated via GitHub OIDC (no long-lived AWS credentials), and a documented security review. Not persistently hosted — a public WordPress admin login isn't something worth leaving exposed indefinitely for a demo. Deployable on demand; see [Deploying this yourself](#deploying-this-yourself).
 
 ## What this demonstrates
 
@@ -12,6 +12,7 @@ A production-style three-tier web architecture on AWS — WordPress running behi
 - Adding a custom domain (`admin.securecloudengineers.com`) with a DNS-validated ACM certificate and a Route 53 record into a hosted zone owned by a *different* project's stack — as a new record, not a modification of that zone's existing records, so it doesn't create the same cross-stack ownership conflict a shared WAF Web ACL would have
 - Building for horizontal scale and resilience: an Auto Scaling Group (2-3 instances) across two Availability Zones behind an Application Load Balancer, with shared state (EFS) so any instance can serve any request identically
 - Read/write splitting with a cross-AZ RDS read replica and the HyperDB drop-in — and *proving* it, not just configuring it: measured live `Com_select` counters to confirm reads actually hit the replica (+399 vs. +1 background noise across 15 requests), then confirmed a real WordPress write succeeds only because it reaches the primary, by separately proving a direct write against the replica fails (`read_only` enforced)
+- Adding a Redis object cache (ElastiCache) as a WordPress drop-in (`object-cache.php`) instead of just configuring the connection and hoping — installed the native PhpRedis PHP extension for real performance, and verified `DBSIZE`/key contents directly against Redis after real traffic, not just that the plugin files existed
 - Recovering from a real failure end-to-end: restoring RDS from a snapshot after the original stack was deliberately deleted, including the specific quirks of a MySQL snapshot restore (`DBName` rejected by the API, master password never carried over from a snapshot)
 - Instrumenting the stack for observability: a CloudWatch dashboard (EC2/RDS CPU, ALB request count) plus a full logging pipeline — ALB access logs to S3, instance and RDS logs to CloudWatch Logs — with cost-conscious, centrally-configured retention
 - Solving a CloudFormation/RDS ownership conflict (RDS auto-creates its own log group; a plain `AWS::Logs::LogGroup` resource would race it) with a small Lambda-backed custom resource, instead of reaching for a workaround that risks replacing the live database
@@ -39,6 +40,7 @@ flowchart TB
         subgraph Private["Private subnets (us-east-1a + us-east-1b)"]
             RDS[("RDS MySQL primary<br/>us-east-1a, not publicly accessible")]
             Replica[("RDS read replica<br/>us-east-1b, not publicly accessible")]
+            Redis[("ElastiCache Redis<br/>object cache, not publicly accessible")]
         end
         EFS[("EFS<br/>shared wp-content")]
     end
@@ -52,6 +54,7 @@ flowchart TB
     ASG -->|"3306 writes (HyperDB), web-tier SG only"| RDS
     ASG -->|"3306 reads (HyperDB), web-tier SG only"| Replica
     RDS -.->|async replication| Replica
+    ASG -->|"6379, web-tier SG only"| Redis
     ASG -->|NFS 2049| EFS
 
     ALB -->|access logs| S3[(S3 bucket)]
@@ -94,6 +97,8 @@ flowchart LR
 | Origin request policy forwards CloudFront's own `CloudFront-*` headers, not just viewer headers | With an HTTP-only ALB origin, the ALB's own `X-Forwarded-Proto` always reads `http` (it reflects the CloudFront-to-ALB hop, not what the viewer actually used), which sent WordPress into an infinite redirect loop on `/wp-admin`. `CloudFront-Forwarded-Proto` carries the viewer's real protocol, but only reaches the origin if the origin request policy explicitly opts into CloudFront's headers — plain `AllViewer` doesn't |
 | Read replica placed via an explicit `AvailabilityZone`, reusing the same security group as the primary | A different AZ than the primary gives it independent power/network/hardware fault domains; sharing the primary's security group is a deliberate simplification since both serve the identical consumer (the web tier) with the identical access pattern — no reason to duplicate the rule set |
 | Read/write splitting via HyperDB (a WordPress drop-in) rather than at the infrastructure layer (e.g. a proxy) | WordPress core has no native concept of a read replica — every query goes wherever `DB_HOST` points. HyperDB intercepts at the `wpdb` layer instead, which is the standard, Automattic-maintained way to do this for WordPress specifically, rather than introducing a separate proxy component (e.g. ProxySQL) this project doesn't otherwise need |
+| Redis object cache via a drop-in (`object-cache.php`), same mechanism as HyperDB | WordPress has no built-in persistent object cache. A drop-in is what the plugin's own "Enable Object Cache" button does, just automated in `UserData` — no wp-admin click required at boot. Single-node, no Multi-AZ: cache data is disposable (rebuilt from RDS on the next read), so there's nothing worth the extra cost or complexity of protecting through a node failure |
+| Native PhpRedis PHP extension installed, not left to the plugin's bundled pure-PHP Predis fallback | The plugin works either way, but PhpRedis is meaningfully faster — checked that Amazon Linux 2023's `php8.3-pecl-redis6` package actually exists before assuming it, rather than guessing at a package name |
 | `DBPassword`'s `AllowedPattern` excludes `'` and `\`, not just `/`, `@`, `"`, and whitespace | Found during a security review: `db-config.php` embeds the password inside a single-quoted PHP string literal, so an unescaped `'` in a chosen password would cause a fatal PHP parse error on every instance boot — a self-inflicted outage from an otherwise-valid password. The older `wp-config.php` `sed` substitution wasn't vulnerable to this specific character |
 
 ## Security review
@@ -161,4 +166,4 @@ aws cloudformation deploy \
 
 ## Tech stack
 
-AWS CloudFormation · Amazon CloudFront · AWS WAF (managed rule groups) · Amazon Route 53 · AWS Certificate Manager (DNS validation) · Amazon VPC · Amazon EC2 (Auto Scaling, Launch Templates) · Elastic Load Balancing (Application Load Balancer) · Amazon RDS (MySQL, read replica) · HyperDB (WordPress read/write DB splitting) · Amazon EFS · AWS Lambda (custom resource) · Amazon CloudWatch (Dashboards, Logs) · AWS IAM (OIDC federation) · Amazon S3 · Amazon Linux 2023 · PHP 8.3 · Apache · WordPress · Terraform (baseline alternate path) · GitHub Actions
+AWS CloudFormation · Amazon CloudFront · AWS WAF (managed rule groups) · Amazon Route 53 · AWS Certificate Manager (DNS validation) · Amazon VPC · Amazon EC2 (Auto Scaling, Launch Templates) · Elastic Load Balancing (Application Load Balancer) · Amazon RDS (MySQL, read replica) · HyperDB (WordPress read/write DB splitting) · Amazon ElastiCache (Redis) · Redis Object Cache (WordPress drop-in) · Amazon EFS · AWS Lambda (custom resource) · Amazon CloudWatch (Dashboards, Logs) · AWS IAM (OIDC federation) · Amazon S3 · Amazon Linux 2023 · PHP 8.3 · Apache · WordPress · Terraform (baseline alternate path) · GitHub Actions

@@ -3,9 +3,9 @@ Description: >
   Three-tier web app. VPC (us-east-1, two AZs) with CloudFront (custom domain, WAF:
   SQLi + common/XSS rules) in front of an ALB + Auto Scaling Group (2-3 instances)
   running WordPress across two public subnets - the ALB only accepts traffic from
-  CloudFront's IP ranges, not the public internet directly. A MySQL RDS primary plus
-  a read replica in the second AZ (WordPress routes writes to the primary, reads to
-  the replica via HyperDB), EFS-shared wp-content, a CloudWatch dashboard, logging
+  CloudFront's IP ranges. A MySQL RDS primary plus a read replica in the second AZ
+  (writes to the primary, reads to the replica via HyperDB) and a Redis object cache
+  (ElastiCache) reduce DB load, EFS-shared wp-content, a CloudWatch dashboard, logging
   (ALB access logs to S3, instance/RDS logs to CloudWatch Logs), and a GitHub Actions
   deploy role via OIDC. The primary RDS instance is single-AZ; the second private
   subnet satisfies RDS's multi-AZ subnet-group requirement and hosts the replica.
@@ -24,7 +24,7 @@ Parameters:
   SecondAvailabilityZone:
     Type: AWS::EC2::AvailabilityZone::Name
     Default: us-east-1b
-    Description: Second Availability Zone, required only to satisfy the RDS DB subnet group's multi-AZ subnet requirement.
+    Description: Second AZ, required to satisfy the RDS DB subnet group's multi-AZ requirement.
 
   VpcCidr:
     Type: String
@@ -64,11 +64,9 @@ Parameters:
 
   DBPassword:
     Type: String
-    # Excludes: / @ " ' \ and whitespace. The ' and \ exclusions are specifically
-    # required by db-config.php's HyperDB setup below, which embeds this value inside
-    # a single-quoted PHP string literal - an unescaped ' would prematurely close that
-    # string (fatal parse error, outage on next boot), and \ can escape the closing quote.
-    Description: Master password for the RDS instance (8-41 characters, no '/', '@', '"', '\'', '\', or spaces).
+    # Excludes: / @ " ' \ and whitespace. ' and \ excluded because db-config.php
+    # embeds this in a single-quoted PHP string - an unescaped ' breaks it.
+    Description: Master password for the RDS instance (8-41 chars, no / @ " ' \ or spaces).
     NoEcho: true
     MinLength: 8
     MaxLength: 41
@@ -88,6 +86,18 @@ Parameters:
     Type: String
     Default: '8.0'
     Description: MySQL engine version.
+
+  RedisNodeType:
+    Type: String
+    Default: cache.t3.micro
+    Description: >-
+      ElastiCache node type for the Redis object cache. cache.t3.micro is eligible
+      for the ElastiCache free tier (750 hrs/month) on a new AWS account.
+
+  RedisEngineVersion:
+    Type: String
+    Default: '7.1'
+    Description: Redis engine version for ElastiCache.
 
   DBBackupRetentionPeriod:
     Type: Number
@@ -137,18 +147,16 @@ Parameters:
   LogRetentionDays:
     Type: Number
     Default: 7
-    Description: Retention period (days) for CloudWatch Logs log groups (instance and RDS logs). Kept short by default to minimize cost.
+    Description: Retention period (days) for CloudWatch Logs log groups.
 
   CloudFrontOriginFacingPrefixListId:
     Type: String
     Default: pl-3b927c52
     Description: >-
-      AWS-managed prefix list ID for CloudFront's origin-facing IP ranges
-      (com.amazonaws.global.cloudfront.origin-facing). Restricts the ALB's security
-      group to CloudFront only, so its WAF can't be bypassed via the ALB's DNS name
-      directly. Consistent across accounts; verify with `aws ec2
-      describe-managed-prefix-lists --filters
-      Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing`.
+      AWS-managed prefix list ID for CloudFront's origin-facing IP ranges. Restricts
+      the ALB's security group to CloudFront only, so its WAF can't be bypassed via
+      the ALB's DNS name. Consistent across accounts; verify with `aws ec2
+      describe-managed-prefix-lists --filters Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing`.
 
   CloudFrontPriceClass:
     Type: String
@@ -157,7 +165,7 @@ Parameters:
       - PriceClass_100
       - PriceClass_200
       - PriceClass_All
-    Description: CloudFront price class. PriceClass_100 (US, Canada, Europe edge locations only) is the cheapest and default here; PriceClass_All adds more edge locations worldwide at higher cost.
+    Description: CloudFront price class. PriceClass_100 (US/Canada/Europe) is cheapest and default; PriceClass_All costs more.
 
   CustomDomainName:
     Type: String
@@ -171,14 +179,13 @@ Parameters:
     Type: String
     Default: Z06930743HC9RLGHJO306
     Description: >-
-      Hosted zone ID for securecloudengineers.com, owned by a separate stack
-      (secure-static-website-aws). Only a new record is added here - the zone
-      itself isn't owned or modified.
+      Hosted zone ID for securecloudengineers.com, owned by a separate stack. Only
+      a new record is added here - the zone itself isn't owned or modified.
 
   GitHubOrg:
     Type: String
     Default: bdahiya2007
-    Description: GitHub username/org that owns the repo allowed to assume the CI deploy role via OIDC.
+    Description: GitHub username/org allowed to assume the CI deploy role via OIDC.
 
   GitHubOrgId:
     Type: String
@@ -192,7 +199,7 @@ Parameters:
 
   GitHubRepo:
     Type: String
-    Description: GitHub repository name (without owner) allowed to assume the CI deploy role via OIDC.
+    Description: GitHub repository name (no owner) allowed to assume the CI deploy role via OIDC.
 
   GitHubRepoId:
     Type: String
@@ -373,12 +380,7 @@ Resources:
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      # Ingress is added below via a separate AWS::EC2::SecurityGroupIngress resource -
-      # the inline property here doesn't support SourcePrefixListId, only that
-      # standalone resource type does.
-      # GroupDescription text left as-is deliberately: it's immutable, so changing it
-      # would force a replacement (recreate + re-associate with the ALB) just for
-      # wording. Real restriction is in ALBSecurityGroupIngressFromCloudFront below.
+      # Ingress added below (inline doesn't support SourcePrefixListId).
       GroupDescription: Allow HTTP access to the Application Load Balancer
       VpcId: !Ref VPC
       Tags:
@@ -388,10 +390,8 @@ Resources:
   ALBSecurityGroupIngressFromCloudFront:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
-      # Only CloudFront's origin-facing IP ranges may reach the ALB directly - the
-      # public entry point is the CloudFront distribution (WAF-protected) below.
-      # Without this, anyone could bypass CloudFront's WAF entirely via the ALB's
-      # DNS name on port 80 directly, making the WAF protection purely cosmetic.
+      # Only CloudFront's IP ranges may reach the ALB directly - without this, its
+      # WAF could be bypassed entirely via the ALB's DNS name.
       GroupId: !Ref ALBSecurityGroup
       IpProtocol: tcp
       FromPort: 80
@@ -499,10 +499,8 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref ALBTargetGroup
 
-  # A dedicated Web ACL, not the pre-existing "securecloudengineers-waf" from the
-  # other portfolio repo in this account - that one lacks XSS coverage and is owned
-  # by an independent stack, so reusing it would mean two stacks fighting over its
-  # rule list on every update.
+  # Dedicated Web ACL, not the pre-existing "securecloudengineers-waf" - that one
+  # lacks XSS coverage and is owned by an independent stack.
   WAFWebACL:
     Type: AWS::WAFv2::WebACL
     Properties:
@@ -511,10 +509,8 @@ Resources:
       Scope: CLOUDFRONT
       DefaultAction:
         Allow: {}
-      # Raises WAF's body inspection window from 8 KB to 64 KB, so the SQLi/XSS rules
-      # below scan a full blog post, not just its first 8 KB. Pairs with the
-      # SizeRestrictions_BODY override below (that stops blocking large bodies; this
-      # keeps them fully inspected once let through).
+      # Raises body inspection 8KB->64KB so SQLi/XSS rules scan a full post
+      # (pairs with the SizeRestrictions_BODY override below).
       AssociationConfig:
         RequestBody:
           CLOUDFRONT:
@@ -544,10 +540,8 @@ Resources:
             ManagedRuleGroupStatement:
               VendorName: AWS
               Name: AWSManagedRulesCommonRuleSet
-              # SizeRestrictions_BODY blocks any body over a hardcoded 8 KB - a heuristic
-              # against oversized payloads, not a content-based attack signature, so it
-              # blocked ordinary WordPress posts too. Counted, not disabled, so it stays
-              # visible in the waf-common metric; the actual SQLi/XSS rules are untouched.
+              # SizeRestrictions_BODY blocked bodies >8KB, including real posts. Counted
+              # not disabled - stays visible; SQLi/XSS untouched.
               RuleActionOverrides:
                 - Name: SizeRestrictions_BODY
                   ActionToUse:
@@ -560,9 +554,6 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-waf
 
-  # DNS-validated ACM cert for CustomDomainName. Must be in us-east-1 for CloudFront
-  # (this stack already deploys there). HostedZoneId lets CloudFormation create/clean
-  # up the validation CNAME itself - no manual console step.
   CustomDomainCertificate:
     Type: AWS::CertificateManager::Certificate
     Properties:
@@ -575,9 +566,8 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-${CustomDomainName}
 
-  # CloudFront in front of the ALB: TLS via CustomDomainCertificate, the WAF above,
-  # and a pass-through cache config (CachingDisabled) since this is dynamic WordPress,
-  # not static content - caching GETs risks leaking one visitor's session to another.
+  # CloudFront in front of the ALB: TLS via CustomDomainCertificate, WAF above, and a
+  # pass-through cache config (CachingDisabled) since this is dynamic WordPress.
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -612,11 +602,10 @@ Resources:
           CachedMethods:
             - GET
             - HEAD
-          # Managed policy "CachingDisabled" (AWS-account-agnostic, stable ID)
+          # Managed policy "CachingDisabled"
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
-          # "AllViewerAndCloudFrontHeaders-2022-06" - forwards all viewer headers/
-          # cookies/query strings plus CloudFront-* headers (CloudFront-Forwarded-Proto
-          # is what wp-config.php uses to avoid an /wp-admin redirect loop; see UserData).
+          # "AllViewerAndCloudFrontHeaders-2022-06" - forwards CloudFront-* headers too
+          # (avoids a /wp-admin redirect loop, see UserData).
           OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc
         ViewerCertificate:
           AcmCertificateArn: !Ref CustomDomainCertificate
@@ -626,8 +615,8 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-cloudfront
 
-  # A + AAAA alias records for CustomDomainName - a new record, not a modification of
-  # the zone's existing ones, so no cross-stack ownership conflict (unlike the WAF ACL).
+  # A + AAAA alias records for CustomDomainName - new records, not a modification
+  # of the zone's existing ones (unlike the WAF ACL, no cross-stack conflict).
   CustomDomainDNSRecord:
     Type: AWS::Route53::RecordSet
     Properties:
@@ -695,6 +684,46 @@ Resources:
       SecurityGroups:
         - !Ref EFSSecurityGroup
 
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow Redis access from the WordPress web servers
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+          Description: Redis access from the WordPress web servers
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-redis-sg
+
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: !Sub Subnet group for ${EnvironmentName} Redis cache
+      SubnetIds:
+        - !Ref PrivateSubnet
+        - !Ref PrivateSubnet2
+
+  # Single node, no Multi-AZ (same tradeoff as RDS primary). Cache data is disposable,
+  # so no encryption/Snapshot policy - see Deployment.md for fallback behavior.
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      ClusterName: !Sub ${EnvironmentName}-redis
+      Engine: redis
+      EngineVersion: !Ref RedisEngineVersion
+      CacheNodeType: !Ref RedisNodeType
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref RedisSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-redis
+
   CloudWatchAgentRole:
     Type: AWS::IAM::Role
     Properties:
@@ -729,9 +758,8 @@ Resources:
 
   WebServerLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
-    # DBInstance/DBReadReplica/HttpdErrorLogGroup/CloudInitLogGroup omitted here:
-    # already enforced implicitly by Ref/GetAtt in UserData (cfn-lint W3005).
-    # EFSMountTarget1/2 aren't referenced there, so they still need listing explicitly.
+    # DB/Redis/log-group resources omitted: implicit via Ref/GetAtt in UserData
+    # (cfn-lint W3005). EFSMountTarget1/2 aren't referenced there, so still listed.
     DependsOn:
       - EFSMountTarget1
       - EFSMountTarget2
@@ -755,7 +783,7 @@ Resources:
             !Sub |
               #!/bin/bash -xe
               dnf update -y
-              dnf install -y httpd php8.3 php8.3-mysqlnd php8.3-fpm php8.3-gd php8.3-xml php8.3-mbstring mariadb105 amazon-efs-utils amazon-cloudwatch-agent wget unzip
+              dnf install -y httpd php8.3 php8.3-mysqlnd php8.3-fpm php8.3-gd php8.3-xml php8.3-mbstring php8.3-pecl-redis6 mariadb105 amazon-efs-utils amazon-cloudwatch-agent wget unzip
 
               mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
               cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWAGENTEOF'
@@ -802,9 +830,8 @@ Resources:
               sed -i "s/password_here/${DBPassword}/" wp-config.php
               sed -i "s/localhost/${DBInstance.Endpoint.Address}/" wp-config.php
 
-              # ALB origin is HTTP-only, so X-Forwarded-Proto always reads "http" (the
-              # CloudFront-to-ALB hop, not the viewer's). CloudFront-Forwarded-Proto
-              # carries the real protocol - without it, WordPress loops /wp-admin forever.
+              # ALB origin is HTTP-only, so X-Forwarded-Proto always reads "http".
+              # CloudFront-Forwarded-Proto carries the real protocol instead.
               cat > /tmp/https-proxy-fix.php <<'PHPSNIPPET'
               if ( isset( $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] ) && $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https' ) {
               	$_SERVER['HTTPS'] = 'on';
@@ -856,6 +883,20 @@ Resources:
               ));
               DBCONFIGEOF
 
+              # Drop-in, same mechanism as db.php above - what the plugin's own
+              # "Enable Object Cache" button does, just automated.
+              cd /tmp
+              wget -q https://downloads.wordpress.org/plugin/redis-cache.zip
+              unzip -q -o redis-cache.zip
+              cp redis-cache/includes/object-cache.php /var/www/html/wp-content/object-cache.php
+
+              cat > /tmp/redis-config.php <<'PHPSNIPPET'
+              define( 'WP_REDIS_HOST', '${RedisCluster.RedisEndpoint.Address}' );
+              define( 'WP_REDIS_PORT', ${RedisCluster.RedisEndpoint.Port} );
+              PHPSNIPPET
+              sed -i "/Add any custom values between this line/r /tmp/redis-config.php" /var/www/html/wp-config.php
+              rm -f /tmp/redis-config.php
+
               chown -R apache:apache /var/www/html
               chmod -R 755 /var/www/html
 
@@ -887,9 +928,8 @@ Resources:
     Type: AWS::RDS::DBInstance
     DeletionPolicy: Snapshot
     UpdateReplacePolicy: Snapshot
-    # cfn-lint W1011 (Secrets Manager dynamic reference vs. plain NoEcho parameter)
-    # suppressed deliberately: at this scale (one password, one CI consumer), Secrets
-    # Manager's ~$0.40/mo buys audit/rotation neither needed yet - a tradeoff, not an oversight.
+    # cfn-lint W1011 suppressed: at this scale, Secrets Manager's ~$0.40/mo audit/
+    # rotation isn't needed yet - a tradeoff, not an oversight.
     Metadata:
       cfn-lint:
         config:
@@ -1039,8 +1079,8 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # CloudFormation actions on this specific stack (and any change sets under it).
-              # ValidateTemplate has no resource-level support, hence the separate "*" statement below.
+              # CloudFormation actions on this stack; ValidateTemplate is separate
+              # below (no resource-level support).
               - Sid: CloudFormationStackAccess
                 Effect: Allow
                 Action:
@@ -1063,9 +1103,8 @@ Resources:
                 Effect: Allow
                 Action: cloudformation:ValidateTemplate
                 Resource: '*'
-              # EC2, Auto Scaling, RDS, ELBv2, EFS, Logs, CloudWatch, and Lambda mostly don't support
-              # resource-level IAM permissions for the create/describe/modify actions a stack deploy
-              # needs (a well-documented AWS limitation, not a shortcut) - scoped tightly by action list instead.
+              # Most don't support resource-level IAM for create/describe/modify
+              # (an AWS limitation) - scoped by action list instead.
               - Sid: InfrastructureServices
                 Effect: Allow
                 Action:
@@ -1104,6 +1143,7 @@ Resources:
                   - rds:*
                   - elasticloadbalancing:*
                   - elasticfilesystem:*
+                  - elasticache:*
                   - logs:*
                   - cloudwatch:*
                   - cloudfront:*
@@ -1121,7 +1161,7 @@ Resources:
                   - ssm:GetParameters
                   - ssm:GetParameter
                 Resource: '*'
-              # S3: scoped to buckets this stack creates (name always starts with the stack name).
+              # S3: scoped to buckets this stack creates.
               - Sid: S3ScopedToThisStack
                 Effect: Allow
                 Action:
@@ -1141,8 +1181,8 @@ Resources:
                   - s3:GetBucketTagging
                 Resource:
                   - arn:aws:s3:::three-tier-app-network-*
-              # Scoped to just this one hosted zone (owned by a separate stack) -
-              # GetChange's change IDs are account-global, so it needs Resource: "*".
+              # Scoped to just this hosted zone; GetChange's change IDs are
+              # account-global so it needs Resource: "*".
               - Sid: Route53ScopedToCustomDomainZone
                 Effect: Allow
                 Action:
@@ -1157,8 +1197,8 @@ Resources:
                   - route53:GetChange
                 Resource:
                   - "*"
-              # IAM: kept the tightest of all, since over-broad IAM permissions on a CI role is a
-              # privilege-escalation risk. Scoped to only the role/instance-profile names this stack creates.
+              # IAM kept tightest of all (privilege-escalation risk) - scoped to just
+              # this stack's own role/instance-profile names.
               - Sid: IamScopedToThisStacksRoles
                 Effect: Allow
                 Action:
@@ -1371,6 +1411,10 @@ Outputs:
     Value: !Ref EFSSecurityGroup
     Export:
       Name: !Sub ${EnvironmentName}-efs-sg-id
+
+  RedisEndpoint:
+    Description: Redis endpoint address used by WordPress as its object cache
+    Value: !GetAtt RedisCluster.RedisEndpoint.Address
 
   CloudWatchDashboardURL:
     Description: URL to the CloudWatch dashboard (EC2/RDS CPU, ALB request count)

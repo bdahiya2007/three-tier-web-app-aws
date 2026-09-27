@@ -1,6 +1,6 @@
 # Deployment
 
-Commands for deploying the full CloudFormation stack for the three-tier web app: a VPC spanning two Availability Zones, CloudFront (custom domain `admin.securecloudengineers.com`, DNS-validated ACM certificate, with a dedicated WAF Web ACL — SQLi and XSS managed rules) in front of an Application Load Balancer + Auto Scaling Group (2-3 instances by default, the ALB restricted to CloudFront's IP ranges only) launching WordPress EC2 instances (Amazon Linux 2023, PHP 8.3, Apache) across two public subnets, a MySQL RDS primary plus a read replica in the second AZ (WordPress routes writes to the primary and reads to the replica via the HyperDB drop-in), an EFS file system mounted at `wp-content` on every instance so uploads/themes/plugins are shared across the group, a CloudWatch dashboard (EC2/RDS CPU, ALB request count), and logging (ALB access logs to S3, instance logs + RDS error log to CloudWatch Logs). Assumes AWS CLI v2 is installed and credentials are configured (`aws configure` or an active SSO/profile session) with permission to create VPC, RDS, EC2, ELBv2, EFS, IAM, S3, CloudWatch, CloudFront, WAF, ACM, Route 53, and Auto Scaling resources.
+Commands for deploying the full CloudFormation stack for the three-tier web app: a VPC spanning two Availability Zones, CloudFront (custom domain `admin.securecloudengineers.com`, DNS-validated ACM certificate, with a dedicated WAF Web ACL — SQLi and XSS managed rules) in front of an Application Load Balancer + Auto Scaling Group (2-3 instances by default, the ALB restricted to CloudFront's IP ranges only) launching WordPress EC2 instances (Amazon Linux 2023, PHP 8.3, Apache) across two public subnets, a MySQL RDS primary plus a read replica in the second AZ (WordPress routes writes to the primary and reads to the replica via the HyperDB drop-in), a single-node ElastiCache Redis cluster used as WordPress's object cache to reduce database load, an EFS file system mounted at `wp-content` on every instance so uploads/themes/plugins are shared across the group, a CloudWatch dashboard (EC2/RDS CPU, ALB request count), and logging (ALB access logs to S3, instance logs + RDS error log to CloudWatch Logs). Assumes AWS CLI v2 is installed and credentials are configured (`aws configure` or an active SSO/profile session) with permission to create VPC, RDS, EC2, ELBv2, EFS, ElastiCache, IAM, S3, CloudWatch, CloudFront, WAF, ACM, Route 53, and Auto Scaling resources.
 
 **Every `deploy` command below needs `--capabilities CAPABILITY_NAMED_IAM`** — the stack creates a named IAM role (`CloudWatchAgentRole`, for the CloudWatch agent on each instance), and CloudFormation refuses to create/update IAM resources without this explicit acknowledgment. Omitting it fails with `Requires capabilities : [CAPABILITY_NAMED_IAM]`.
 
@@ -291,7 +291,7 @@ aws cloudformation describe-stacks \
   --query "Stacks[0].StackStatus"
 ```
 
-## View stack outputs (VPC ID, subnet IDs, route table IDs, RDS endpoint, ALB DNS name, CloudFront domain, custom domain certificate ARN, WAF Web ACL ARN, EFS file system ID, CloudWatch dashboard URL, ALB logs bucket, log group names, WordPress URL)
+## View stack outputs (VPC ID, subnet IDs, route table IDs, RDS endpoint, Redis endpoint, ALB DNS name, CloudFront domain, custom domain certificate ARN, WAF Web ACL ARN, EFS file system ID, CloudWatch dashboard URL, ALB logs bucket, log group names, WordPress URL)
 
 ```bash
 aws cloudformation describe-stacks \
@@ -750,6 +750,50 @@ Read replicas are asynchronous — there's a small delay between a write landing
 
 Same rule as any other `UserData` change: a stack update alone doesn't touch already-running instances. Run an instance refresh (see "Update running instances after a launch template change" above) to actually roll out `db.php`/`db-config.php` to instances that existed before this feature was added.
 
+## Redis object cache (ElastiCache)
+
+`RedisCluster` is a single-node ElastiCache Redis cluster (`RedisNodeType`, default `cache.t3.micro` — eligible for the ElastiCache free tier) in the private subnets, reachable only from `WebServerSecurityGroup` on port 6379 (`RedisSecurityGroup`). No Multi-AZ, no encryption, no snapshot policy — the same single-node simplicity tradeoff as the RDS primary, and unlike RDS, cache data is inherently disposable (rebuilt from the database on the next read), so there's nothing worth preserving through a node failure or stack teardown.
+
+**Cost added**: `cache.t3.micro` is $0.014/hour on-demand in `us-east-1` (verified via `aws pricing get-products`), roughly ~$10/month — free for the first 12 months on an eligible new AWS account under ElastiCache's free tier (750 node-hours/month), which covers this single node's usage entirely as long as nothing else in the account is also consuming that same free tier allowance. Brings the running total from the earlier ~$57-61/month estimate to roughly **$67-71/month** (or ~$57-61/month if still within the ElastiCache free tier).
+
+WordPress has no built-in object cache backend beyond a per-request in-memory array. `UserData` installs the [Redis Object Cache](https://wordpress.org/plugins/redis-cache/) plugin's `object-cache.php` **drop-in** directly into `wp-content` — the same mechanism as HyperDB's `db.php` above, and exactly what clicking "Enable Object Cache" in the plugin's admin UI does, just automated:
+
+1. `php8.3-pecl-redis6` (the native PhpRedis extension, confirmed available for Amazon Linux 2023's php8.3 package) is installed alongside the other PHP packages, so the plugin doesn't fall back to its slower pure-PHP Predis client.
+2. Downloads the plugin, copies `redis-cache/includes/object-cache.php` to `wp-content/object-cache.php`.
+3. Appends `WP_REDIS_HOST`/`WP_REDIS_PORT` (pointing at `RedisCluster`'s endpoint) to `wp-config.php`, the same insert-after-marker approach already used for the CloudFront-Forwarded-Proto fix.
+
+This caches expensive, repeated database reads — `WP_Query` results, post meta, comment queries, transients, options — across requests and across instances (every instance in the Auto Scaling Group shares the same Redis cluster), which is what actually reduces load on `DBInstance` under real traffic; HyperDB's read replica helps with read *scaling*, this helps with read *avoidance* entirely for cacheable data.
+
+### Verify it's actually caching, not just installed
+
+Same principle as everywhere else in this file. Confirm the extension loaded, the drop-in is in place, and — the only proof that matters — that Redis actually contains real WordPress cache entries after normal site traffic:
+
+```bash
+# on any instance:
+php -m | grep -i redis                                    # confirms the PhpRedis extension loaded
+grep WP_REDIS_HOST /var/www/html/wp-config.php             # confirms the connection config is present
+```
+
+```bash
+# a quick direct connectivity + content check (uses the extension directly, no wp-cli needed):
+php -r "
+\$r = new Redis();
+\$r->connect('<redis-endpoint>', 6379, 2);
+echo 'DBSIZE: ' . \$r->dbSize() . PHP_EOL;
+foreach (array_slice(\$r->keys('*'), 0, 10) as \$k) { echo \$k . PHP_EOL; }
+"
+```
+
+Live result from this exact test after a normal instance refresh (no synthetic traffic): `DBSIZE: 126`, with keys like `wp:post-queries:wp_query-<hash>`, `wp:post_meta:<id>`, `wp:comment-queries:get_comments-<hash>`, and `wp:site-transient:update_themes` — real WordPress cache groups, not test data, confirming the object cache is actively populated from real page loads rather than merely configured.
+
+### Fallback behavior if Redis is unreachable
+
+The Redis Object Cache plugin is documented to catch connection failures and fall back to WordPress's default non-persistent (per-request, in-memory) object cache automatically, rather than a fatal error — so a Redis outage means degraded performance (every request re-queries the database, same as before this feature existed), not site downtime. This wasn't verified against this specific deployment with a live failure test (that would mean temporarily revoking `RedisSecurityGroup`'s ingress rule in production, a real if brief security-relevant change not taken without asking first) — treat it as the plugin's documented behavior rather than something proven here. To verify it yourself: temporarily remove the ingress rule, confirm the site still loads (slower, and `WP_REDIS_DISABLED`/connection-error notices may appear depending on `WP_DEBUG`), then restore it.
+
+### After adding/changing anything Redis-related
+
+Same rule as the read replica above: a stack update alone doesn't touch already-running instances. Run an instance refresh to roll out the extension, plugin drop-in, and `wp-config.php` changes to instances that existed before this feature was added.
+
 ## Troubleshooting
 
 Every issue actually hit while building and operating this stack, with symptom → cause → fix. Check here first before re-diagnosing from scratch.
@@ -1040,7 +1084,7 @@ No AWS access key/secret key secrets exist at all with this approach — a role 
 
 Scoped deliberately, not a broad managed policy:
 - **CloudFormation** actions restricted to this one stack's ARN (`stack/three-tier-app-network/*`); `ValidateTemplate` is separate since that action has no resource-level permission support.
-- **EC2, Auto Scaling, RDS, ELBv2, EFS, Logs, CloudWatch, Lambda, SSM, CloudFront, WAFv2, ACM**: action list scoped to only what a deploy needs (not `service:*` wildcards, except where AWS groups related actions like `autoscaling:*`/`rds:*`/`elasticfilesystem:*`/`cloudfront:*`/`wafv2:*`/`acm:*` themselves) — but on `Resource: "*"`, since most of these create/describe/modify actions genuinely don't support resource-level ARN restriction in AWS's own IAM implementation (a documented AWS limitation, not a shortcut here). ACM specifically has no such restriction to apply anyway: a certificate's ARN doesn't exist yet at policy-write time, and DNS-validated certs are typically single-use per domain.
+- **EC2, Auto Scaling, RDS, ELBv2, EFS, ElastiCache, Logs, CloudWatch, Lambda, SSM, CloudFront, WAFv2, ACM**: action list scoped to only what a deploy needs (not `service:*` wildcards, except where AWS groups related actions like `autoscaling:*`/`rds:*`/`elasticfilesystem:*`/`elasticache:*`/`cloudfront:*`/`wafv2:*`/`acm:*` themselves) — but on `Resource: "*"`, since most of these create/describe/modify actions genuinely don't support resource-level ARN restriction in AWS's own IAM implementation (a documented AWS limitation, not a shortcut here). ACM specifically has no such restriction to apply anyway: a certificate's ARN doesn't exist yet at policy-write time, and DNS-validated certs are typically single-use per domain.
 - **Route 53**: restricted to the one hosted zone this stack adds a record into (`arn:aws:route53:::hostedzone/<id>`), not `route53:*` on every zone in the account — unlike most of the list above, Route 53 record actions genuinely do support resource-level ARN restriction, so there was no reason not to use it. `route53:GetChange` is the one exception (`Resource: "*"`) since change IDs aren't scoped to a zone.
 - **S3**: restricted to bucket names starting with `three-tier-app-network-` (this stack's naming convention for the ALB logs bucket).
 - **IAM**: the tightest of all, since over-broad IAM permissions on a CI role is a privilege-escalation risk — restricted to role/instance-profile ARNs starting with `three-tier-app-` (this stack's own resources only, including the role itself, so future deploys can still update its own permissions).
