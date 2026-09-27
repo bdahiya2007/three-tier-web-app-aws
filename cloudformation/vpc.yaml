@@ -64,12 +64,10 @@ Parameters:
 
   DBPassword:
     Type: String
-    # Excludes: / @ " ' \ and whitespace. The single quote and backslash exclusions
-    # are specifically required by db-config.php's HyperDB setup below, which embeds
-    # this value inside a single-quoted PHP string literal - an unescaped ' would
-    # prematurely close that string (fatal PHP parse error, site-wide outage on the
-    # next instance boot with such a password), and \ can escape the closing quote
-    # in unexpected ways depending on what follows it.
+    # Excludes: / @ " ' \ and whitespace. The ' and \ exclusions are specifically
+    # required by db-config.php's HyperDB setup below, which embeds this value inside
+    # a single-quoted PHP string literal - an unescaped ' would prematurely close that
+    # string (fatal parse error, outage on next boot), and \ can escape the closing quote.
     Description: Master password for the RDS instance (8-41 characters, no '/', '@', '"', '\'', '\', or spaces).
     NoEcho: true
     MinLength: 8
@@ -375,15 +373,12 @@ Resources:
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      # Ingress is added below via a separate AWS::EC2::SecurityGroupIngress
-      # resource, not inline here - the inline SecurityGroupIngress property on
-      # AWS::EC2::SecurityGroup doesn't support SourcePrefixListId, only the
+      # Ingress is added below via a separate AWS::EC2::SecurityGroupIngress resource -
+      # the inline property here doesn't support SourcePrefixListId, only that
       # standalone resource type does.
-      # Left as the original text deliberately: GroupDescription is immutable, and
-      # changing it would force CloudFormation to replace this security group
-      # (recreate + re-associate with the ALB and every SG that references it) just
-      # for a cosmetic wording update. The real restriction is in the separate
-      # ALBSecurityGroupIngressFromCloudFront resource below.
+      # GroupDescription text left as-is deliberately: it's immutable, so changing it
+      # would force a replacement (recreate + re-associate with the ALB) just for
+      # wording. Real restriction is in ALBSecurityGroupIngressFromCloudFront below.
       GroupDescription: Allow HTTP access to the Application Load Balancer
       VpcId: !Ref VPC
       Tags:
@@ -395,9 +390,8 @@ Resources:
     Properties:
       # Only CloudFront's origin-facing IP ranges may reach the ALB directly - the
       # public entry point is the CloudFront distribution (WAF-protected) below.
-      # Without this restriction, anyone could bypass CloudFront and its WAF Web
-      # ACL entirely by hitting the ALB's DNS name on port 80 directly, making the
-      # WAF protection purely cosmetic.
+      # Without this, anyone could bypass CloudFront's WAF entirely via the ALB's
+      # DNS name on port 80 directly, making the WAF protection purely cosmetic.
       GroupId: !Ref ALBSecurityGroup
       IpProtocol: tcp
       FromPort: 80
@@ -517,6 +511,14 @@ Resources:
       Scope: CLOUDFRONT
       DefaultAction:
         Allow: {}
+      # Raises WAF's body inspection window from 8 KB to 64 KB, so the SQLi/XSS rules
+      # below scan a full blog post, not just its first 8 KB. Pairs with the
+      # SizeRestrictions_BODY override below (that stops blocking large bodies; this
+      # keeps them fully inspected once let through).
+      AssociationConfig:
+        RequestBody:
+          CLOUDFRONT:
+            DefaultSizeInspectionLimit: KB_64
       VisibilityConfig:
         SampledRequestsEnabled: true
         CloudWatchMetricsEnabled: true
@@ -542,6 +544,14 @@ Resources:
             ManagedRuleGroupStatement:
               VendorName: AWS
               Name: AWSManagedRulesCommonRuleSet
+              # SizeRestrictions_BODY blocks any body over a hardcoded 8 KB - a heuristic
+              # against oversized payloads, not a content-based attack signature, so it
+              # blocked ordinary WordPress posts too. Counted, not disabled, so it stays
+              # visible in the waf-common metric; the actual SQLi/XSS rules are untouched.
+              RuleActionOverrides:
+                - Name: SizeRestrictions_BODY
+                  ActionToUse:
+                    Count: {}
           VisibilityConfig:
             SampledRequestsEnabled: true
             CloudWatchMetricsEnabled: true
@@ -565,11 +575,9 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-${CustomDomainName}
 
-  # CloudFront in front of the ALB: TLS via CustomDomainCertificate, the WAF Web ACL
-  # above, and a pass-through cache config (CachingDisabled) since this is dynamic
-  # WordPress, not static content - caching GETs risks leaking one visitor's
-  # logged-in/session page to another. Path-based caching for static paths (e.g.
-  # /wp-content/uploads/*) would be a sensible future optimization, out of scope here.
+  # CloudFront in front of the ALB: TLS via CustomDomainCertificate, the WAF above,
+  # and a pass-through cache config (CachingDisabled) since this is dynamic WordPress,
+  # not static content - caching GETs risks leaking one visitor's session to another.
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -721,12 +729,9 @@ Resources:
 
   WebServerLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
-    # DBInstance, DBReadReplica, HttpdErrorLogGroup, and CloudInitLogGroup are
-    # deliberately not listed here: their dependency is already enforced implicitly
-    # by the Ref/GetAtt usages inside UserData below (cfn-lint W3005) - an explicit
-    # DependsOn on them would be redundant. EFSMountTarget1/2 are NOT referenced
-    # anywhere in UserData (only EFSFileSystem is), so they still need to be listed
-    # explicitly.
+    # DBInstance/DBReadReplica/HttpdErrorLogGroup/CloudInitLogGroup omitted here:
+    # already enforced implicitly by Ref/GetAtt in UserData (cfn-lint W3005).
+    # EFSMountTarget1/2 aren't referenced there, so they still need listing explicitly.
     DependsOn:
       - EFSMountTarget1
       - EFSMountTarget2
@@ -798,9 +803,8 @@ Resources:
               sed -i "s/localhost/${DBInstance.Endpoint.Address}/" wp-config.php
 
               # ALB origin is HTTP-only, so X-Forwarded-Proto always reads "http" (the
-              # CloudFront-to-ALB hop, not what the viewer used). CloudFront-Forwarded-Proto
-              # carries the viewer's real protocol instead - without this, WordPress
-              # thinks every request is HTTP and infinitely redirects /wp-admin to itself.
+              # CloudFront-to-ALB hop, not the viewer's). CloudFront-Forwarded-Proto
+              # carries the real protocol - without it, WordPress loops /wp-admin forever.
               cat > /tmp/https-proxy-fix.php <<'PHPSNIPPET'
               if ( isset( $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] ) && $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https' ) {
               	$_SERVER['HTTPS'] = 'on';
@@ -883,11 +887,9 @@ Resources:
     Type: AWS::RDS::DBInstance
     DeletionPolicy: Snapshot
     UpdateReplacePolicy: Snapshot
-    # cfn-lint W1011 (use a Secrets Manager dynamic reference instead of a plain
-    # NoEcho parameter for MasterUserPassword) is deliberately suppressed here:
-    # for this project's scale (one password, one CI workflow consumer), Secrets
-    # Manager's ~$0.40/month per secret buys audit trail and rotation neither of
-    # which are needed yet - a deliberate cost/security tradeoff, not an oversight.
+    # cfn-lint W1011 (Secrets Manager dynamic reference vs. plain NoEcho parameter)
+    # suppressed deliberately: at this scale (one password, one CI consumer), Secrets
+    # Manager's ~$0.40/mo buys audit/rotation neither needed yet - a tradeoff, not an oversight.
     Metadata:
       cfn-lint:
         config:
