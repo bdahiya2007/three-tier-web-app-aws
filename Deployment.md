@@ -517,7 +517,21 @@ This template creates its own dedicated `WAFWebACL`, scoped only to this project
 
 ### Why caching is disabled
 
-`DefaultCacheBehavior` uses the AWS managed `CachingDisabled` policy plus the `AllViewer` origin request policy (forwards all headers/cookies/query strings to the origin). WordPress is a dynamic, session-aware application — caching GET responses at the edge risks serving one visitor's logged-in or nonce-specific page to another visitor entirely. This makes CloudFront function purely as a TLS-termination + WAF-enforcement layer for now, not a performance cache. Adding real caching for genuinely static paths (e.g. `/wp-content/uploads/*`) via a path-based cache behavior would be a sensible next step, out of scope for just adding WAF protection.
+`DefaultCacheBehavior` uses the AWS managed `CachingDisabled` policy plus the `AllViewerAndCloudFrontHeaders-2022-06` origin request policy (forwards all headers/cookies/query strings to the origin, plus CloudFront's own `CloudFront-*` headers — see below for why that second part matters). WordPress is a dynamic, session-aware application — caching GET responses at the edge risks serving one visitor's logged-in or nonce-specific page to another visitor entirely. This makes CloudFront function purely as a TLS-termination + WAF-enforcement layer for now, not a performance cache. Adding real caching for genuinely static paths (e.g. `/wp-content/uploads/*`) via a path-based cache behavior would be a sensible next step, out of scope for just adding WAF protection.
+
+### Why the origin request policy forwards `CloudFront-*` headers (avoiding an infinite `/wp-admin` redirect)
+
+The ALB origin is HTTP-only (`OriginProtocolPolicy: http-only` — there's no ALB HTTPS listener/certificate in this template), so CloudFront always talks to the ALB over plain HTTP even though the viewer's request came in over HTTPS. The ALB, in turn, adds its own `X-Forwarded-Proto` header reflecting *its own* listener protocol — which is `http` — not what the viewer actually used. WordPress (with `siteurl`/`home` set to the `https://` CloudFront domain) sees a plain-HTTP request, decides the URL scheme is wrong, and redirects `/wp-admin` to itself — forever, since every retry looks exactly like the first request.
+
+The fix isn't in `X-Forwarded-Proto` at all — it's `CloudFront-Forwarded-Proto`, a header CloudFront itself adds that reflects the *viewer's* real protocol, not the CloudFront-to-origin hop. CloudFront only forwards its `CloudFront-*` headers to the origin when the origin request policy explicitly includes them, which is why this template uses `AllViewerAndCloudFrontHeaders-2022-06` instead of plain `AllViewer`. `wp-config.php`'s generated UserData then does:
+
+```php
+if ( isset( $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] ) && $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https' ) {
+	$_SERVER['HTTPS'] = 'on';
+}
+```
+
+inserted right after the "Add any custom values" marker in `wp-config.php`, so WordPress's own `is_ssl()` check reports correctly and stops redirecting. See "`/wp-admin` redirects to itself forever" in Troubleshooting for the exact symptom and how this was diagnosed.
 
 ### After deploying: fix `wp_options` again
 
@@ -725,6 +739,22 @@ Every issue actually hit while building and operating this stack, with symptom �
 - **Cause**: EC2 security group rule `Description` fields only accept a specific character set — notably **no apostrophe**. `HTTP access from CloudFront's origin-facing IP ranges only` failed for exactly this reason (the `'` in "CloudFront's"). Easy to miss since apostrophes look completely ordinary in prose, and most other AWS string fields (tags, resource descriptions elsewhere in this same template) don't have this restriction.
 - **Fix**: Reword to avoid the character entirely (`CloudFront origin-facing IP ranges` instead of `CloudFront's origin-facing IP ranges`) rather than trying to escape it — the allowed set has no escape mechanism, the character simply isn't permitted.
 - **General lesson**: this specific field has a narrower allowed character set than most other AWS string properties. Worth a second look at rule/security-group `Description` text specifically (not just parameter values, which is where the previous "excludes `'`" lesson from `DBPassword` came from) before assuming any plain English sentence is safe to use verbatim.
+
+### `/wp-admin` redirects to itself forever
+
+- **Symptom**: `curl -v https://<cloudfront-domain>/wp-admin/` returns `302` with `location:` pointing at the *exact same URL* (`/wp-admin/` → `/wp-admin/`), not `wp-login.php`. Every retry produces the identical response — a genuine infinite loop, not a normal not-logged-in redirect. The rest of the site (homepage, etc.) loads fine.
+- **Cause**: The ALB origin is HTTP-only, so the `X-Forwarded-Proto` header WordPress sees always reads `http` (it reflects the CloudFront-to-ALB hop, added by the ALB itself, not the viewer-to-CloudFront hop). With `siteurl`/`home` set to the `https://` CloudFront domain, WordPress thinks every request arrived over the wrong scheme and keeps "correcting" it — into the same wrong state, forever.
+- **How this was actually diagnosed**: A quick PHP script dumping every `HTTP_*` / `HTTPS` entry in `$_SERVER`, hit through CloudFront, confirmed `HTTP_X_FORWARDED_PROTO=http` even though the original request was HTTPS — ruling out a guess-and-check fix. The same dump showed `HTTP_CLOUDFRONT_FORWARDED_PROTO` was simply absent, because the origin request policy in use at the time (`AllViewer`) doesn't forward CloudFront's own `CloudFront-*` headers — only real viewer-sent headers.
+- **Fix**: Two parts, both needed together:
+  1. Switch the distribution's `OriginRequestPolicyId` to the managed `AllViewerAndCloudFrontHeaders-2022-06` policy (`33f36d7e-f396-46d9-90e0-52428a34d9dc`), so `CloudFront-Forwarded-Proto` (the viewer's *real* protocol) actually reaches the origin.
+  2. In `wp-config.php`, treat that header — not `X-Forwarded-Proto` — as the signal:
+     ```php
+     if ( isset( $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] ) && $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https' ) {
+     	$_SERVER['HTTPS'] = 'on';
+     }
+     ```
+  Both are baked into the template now (`CloudFrontDistribution`'s origin request policy and the web server `UserData`, respectively), so new instances get this automatically — no manual step needed for future deploys.
+- **General lesson**: on a distribution whose origin is HTTP-only, `X-Forwarded-Proto` is not a reliable signal for "what protocol did the viewer actually use" — it's set by whatever's immediately upstream of the origin (here, the ALB's own listener), not the original viewer. `CloudFront-Forwarded-Proto` is the header that actually carries that information, and it has to be explicitly opted into via the origin request policy.
 
 ### GitHub Actions OIDC: "Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity"
 
