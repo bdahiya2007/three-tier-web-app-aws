@@ -2,17 +2,19 @@
 
 [![Deploy CloudFormation Stack](https://github.com/bdahiya2007/three-tier-web-app-aws/actions/workflows/deploy.yml/badge.svg)](https://github.com/bdahiya2007/three-tier-web-app-aws/actions/workflows/deploy.yml)
 
-A production-style three-tier web architecture on AWS — WordPress running on a horizontally-scaled, self-healing web tier, backed by a database that's never directly reachable, with shared state, full observability, and a CI/CD pipeline authenticated via GitHub OIDC (no long-lived AWS credentials). Not persistently hosted at a public URL — the ALB's DNS name isn't stable across a stack teardown/recreate, and a public WordPress admin login isn't something worth leaving exposed indefinitely for a demo. Deployable on demand; see [Deploying this yourself](#deploying-this-yourself).
+A production-style three-tier web architecture on AWS — WordPress running on a horizontally-scaled, self-healing web tier, backed by a database that's never directly reachable and splits reads across a cross-AZ read replica, with shared state, full observability, a CI/CD pipeline authenticated via GitHub OIDC (no long-lived AWS credentials), and a documented security review. Not persistently hosted at a public URL — the ALB's DNS name isn't stable across a stack teardown/recreate, and a public WordPress admin login isn't something worth leaving exposed indefinitely for a demo. Deployable on demand; see [Deploying this yourself](#deploying-this-yourself).
 
 ## What this demonstrates
 
 - Designing a three-tier architecture where the data tier (RDS) is never publicly reachable — only the web tier's security group can reach it, on the database port, nothing else
 - Building for horizontal scale and resilience: an Auto Scaling Group (2-3 instances) across two Availability Zones behind an Application Load Balancer, with shared state (EFS) so any instance can serve any request identically
+- Read/write splitting with a cross-AZ RDS read replica and the HyperDB drop-in — and *proving* it, not just configuring it: measured live `Com_select` counters to confirm reads actually hit the replica (+399 vs. +1 background noise across 15 requests), then confirmed a real WordPress write succeeds only because it reaches the primary, by separately proving a direct write against the replica fails (`read_only` enforced)
 - Recovering from a real failure end-to-end: restoring RDS from a snapshot after the original stack was deliberately deleted, including the specific quirks of a MySQL snapshot restore (`DBName` rejected by the API, master password never carried over from a snapshot)
 - Instrumenting the stack for observability: a CloudWatch dashboard (EC2/RDS CPU, ALB request count) plus a full logging pipeline — ALB access logs to S3, instance and RDS logs to CloudWatch Logs — with cost-conscious, centrally-configured retention
 - Solving a CloudFormation/RDS ownership conflict (RDS auto-creates its own log group; a plain `AWS::Logs::LogGroup` resource would race it) with a small Lambda-backed custom resource, instead of reaching for a workaround that risks replacing the live database
 - Replacing long-lived AWS credentials with GitHub OIDC role assumption — including tracking down the real cause of a failed `AssumeRoleWithWebIdentity` call via CloudTrail (GitHub's `sub` claim embeds immutable numeric org/repo IDs, not just names)
 - Writing a least-privilege IAM policy for the CI role: scoped to this stack's specific resource ARNs wherever AWS's IAM model supports it, and to a tight action list (not `service:*`) where it doesn't
+- Running a security architect review that found and fixed a real input-validation gap (see [Security review](#security-review) below) rather than declaring victory once the feature merely deployed without errors
 - Documenting every failure encountered as it happened — root cause and fix, not just the happy path — in [Deployment.md](Deployment.md)
 
 ## Architecture
@@ -27,14 +29,17 @@ flowchart TB
             ASG["Auto Scaling Group<br/>WordPress on EC2<br/>Amazon Linux 2023, PHP 8.3<br/>2-3 instances"]
         end
         subgraph Private["Private subnets (us-east-1a + us-east-1b)"]
-            RDS[("RDS MySQL<br/>single-AZ, not publicly accessible")]
+            RDS[("RDS MySQL primary<br/>us-east-1a, not publicly accessible")]
+            Replica[("RDS read replica<br/>us-east-1b, not publicly accessible")]
         end
         EFS[("EFS<br/>shared wp-content")]
     end
 
     Internet -->|HTTP| ALB
     ALB -->|HTTP, ALB security group only| ASG
-    ASG -->|3306, web-tier SG only| RDS
+    ASG -->|"3306 writes (HyperDB), web-tier SG only"| RDS
+    ASG -->|"3306 reads (HyperDB), web-tier SG only"| Replica
+    RDS -.->|async replication| Replica
     ASG -->|NFS 2049| EFS
 
     ALB -->|access logs| S3[(S3 bucket)]
@@ -69,14 +74,36 @@ flowchart LR
 | GitHub Actions authenticates via OIDC role assumption, not access keys | No long-lived AWS credentials stored in GitHub at all. The trust policy checks the token's `sub` claim — including GitHub's immutable numeric org/repo IDs, not just the names — against this exact repository and branch |
 | CI role's IAM policy: tight action lists on `Resource: "*"` for most infrastructure services, ARN-scoped for IAM and S3 | Most EC2/RDS/ELB/EFS/Lambda create-and-describe actions don't support resource-level ARN restriction in AWS's own IAM model — scope is enforced via the action list instead. IAM permissions are the tightest of all, since over-broad IAM permissions on a CI role is a privilege-escalation risk |
 | Snapshot restore is parameter-driven (`DBSnapshotIdentifier`), not a separate template | The same template can either create a fresh database or restore a prior one, decided at deploy time — used for real after the stack was deliberately deleted and needed its WordPress content back |
+| Read replica placed via an explicit `AvailabilityZone`, reusing the same security group as the primary | A different AZ than the primary gives it independent power/network/hardware fault domains; sharing the primary's security group is a deliberate simplification since both serve the identical consumer (the web tier) with the identical access pattern — no reason to duplicate the rule set |
+| Read/write splitting via HyperDB (a WordPress drop-in) rather than at the infrastructure layer (e.g. a proxy) | WordPress core has no native concept of a read replica — every query goes wherever `DB_HOST` points. HyperDB intercepts at the `wpdb` layer instead, which is the standard, Automattic-maintained way to do this for WordPress specifically, rather than introducing a separate proxy component (e.g. ProxySQL) this project doesn't otherwise need |
+| `DBPassword`'s `AllowedPattern` excludes `'` and `\`, not just `/`, `@`, `"`, and whitespace | Found during a security review: `db-config.php` embeds the password inside a single-quoted PHP string literal, so an unescaped `'` in a chosen password would cause a fatal PHP parse error on every instance boot — a self-inflicted outage from an otherwise-valid password. The older `wp-config.php` `sed` substitution wasn't vulnerable to this specific character |
+
+## Security review
+
+Adding the RDS read replica was followed by a dedicated security/architecture review — auditing both the CloudFormation code and the live deployed state, then proving behavior empirically rather than trusting that "it deployed without errors" means "it works correctly."
+
+**Verified, with evidence, not just configuration:**
+- Replica confirmed in a different AZ than the primary; both instances `PubliclyAccessible: false`; both DB subnets' route tables have only a local VPC route — no gateway path at all, confirmed at the routing layer, not just the API flag
+- Security group scoped to TCP 3306 from the web tier's security group only, shared correctly by both instances
+- **Reads actually reach the replica**: measured `SHOW GLOBAL STATUS` `Com_select` before/after 15 page loads — replica +399, primary +1 (background noise)
+- **Writes actually reach the primary**: ran a real `$wpdb->query()` INSERT through the live HyperDB code path (succeeded, no error), then separately confirmed a *direct* write attempt against the replica fails outright (`read_only` enforced) — proving the first write couldn't have landed there
+- The replica's `read_only` enforcement acts as a fail-safe independent of HyperDB's own config: even a HyperDB misconfiguration couldn't cause a silent write to the replica; it would error loudly instead
+
+**Found and fixed**: `DBPassword`'s `AllowedPattern` didn't exclude `'` or `\`, which could break `db-config.php`'s PHP string literal and take the site down on a future password rotation — see the table above.
+
+**Found, not yet fixed (flagged for a deliberate decision, not an oversight)**:
+- Neither RDS instance is encrypted at rest. This predates the replica, but a replica must match its source's encryption status, so the gap is now on two instances instead of one. Remediation requires snapshot → restore-as-encrypted for the primary (a new endpoint, genuinely disruptive) before the replica could be recreated encrypted too.
+- No TLS enforcement in transit between WordPress and RDS (`require_secure_transport` unset). Partially mitigated by VPC-level network isolation, but doesn't meet defense-in-depth for data-in-transit on its own.
+
+Full methodology (exact commands, the counter values, the `read_only` proof) is in [Deployment.md](Deployment.md#rds-read-replica-and-wordpress-readwrite-splitting).
 
 ## Repository structure
 
 ```
 .
 ├── cloudformation/
-│   └── vpc.yaml                  # VPC, ALB + Auto Scaling Group, RDS, EFS, CloudWatch dashboard,
-│                                  # logging (S3 + CloudWatch Logs), GitHub OIDC deploy role
+│   └── vpc.yaml                  # VPC, ALB + Auto Scaling Group, RDS primary + read replica, EFS,
+│                                  # CloudWatch dashboard, logging (S3 + CloudWatch Logs), GitHub OIDC deploy role
 ├── terraform/                    # Earlier, simpler baseline (see note below) — not feature-equivalent
 ├── .github/workflows/deploy.yml  # CI/CD: GitHub OIDC authentication, deploy on push to main
 ├── Deployment.md                 # Full deployment guide, every parameter, and an extensive
@@ -117,4 +144,4 @@ aws cloudformation deploy \
 
 ## Tech stack
 
-AWS CloudFormation · Amazon VPC · Amazon EC2 (Auto Scaling, Launch Templates) · Elastic Load Balancing (Application Load Balancer) · Amazon RDS (MySQL) · Amazon EFS · AWS Lambda (custom resource) · Amazon CloudWatch (Dashboards, Logs) · AWS IAM (OIDC federation) · Amazon S3 · Amazon Linux 2023 · PHP 8.3 · Apache · WordPress · Terraform (baseline alternate path) · GitHub Actions
+AWS CloudFormation · Amazon VPC · Amazon EC2 (Auto Scaling, Launch Templates) · Elastic Load Balancing (Application Load Balancer) · Amazon RDS (MySQL, read replica) · HyperDB (WordPress read/write DB splitting) · Amazon EFS · AWS Lambda (custom resource) · Amazon CloudWatch (Dashboards, Logs) · AWS IAM (OIDC federation) · Amazon S3 · Amazon Linux 2023 · PHP 8.3 · Apache · WordPress · Terraform (baseline alternate path) · GitHub Actions

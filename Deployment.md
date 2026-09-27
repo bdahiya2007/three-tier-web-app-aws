@@ -4,7 +4,7 @@ Commands for deploying the full CloudFormation stack for the three-tier web app:
 
 **Every `deploy` command below needs `--capabilities CAPABILITY_NAMED_IAM`** — the stack creates a named IAM role (`CloudWatchAgentRole`, for the CloudWatch agent on each instance), and CloudFormation refuses to create/update IAM resources without this explicit acknowledgment. Omitting it fails with `Requires capabilities : [CAPABILITY_NAMED_IAM]`.
 
-The `DBPassword` parameter has no default and must be supplied at deploy time (8-41 characters, no `/`, `@`, `"`, or spaces).
+The `DBPassword` parameter has no default and must be supplied at deploy time (8-41 characters, no `/`, `@`, `"`, `'`, `\`, or spaces — the last two are excluded specifically because `db-config.php`'s HyperDB setup embeds this value inside a single-quoted PHP string literal; an unescaped `'` would break that string and take the site down on the next instance boot).
 
 If your account is on the RDS free tier, `DBBackupRetentionPeriod` must stay at its default (`1`) — a higher value fails with `The specified backup retention period exceeds the maximum available to free tier customers`.
 
@@ -616,6 +616,37 @@ cat /var/www/html/db-config.php                          # confirms both hosts a
 ```
 
 If `db.php` is missing, WordPress silently falls back to its built-in single-connection `wpdb` (talking only to whatever `DB_HOST` is in `wp-config.php`, i.e. the primary) — the site still works, it just isn't actually using the replica for anything. There's no error in this failure mode, so checking the file is the only way to confirm HyperDB is actually active, not just configured in principle.
+
+**That still only proves the config is correct, not that routing actually happens.** For real proof, compare `Com_select` on both hosts before/after generating read traffic — no special privilege needed, just `SHOW GLOBAL STATUS` (not plain `SHOW STATUS`, which is session-scoped and useless here since every new `mysql` connection starts a fresh, zeroed counter):
+
+```bash
+# on any instance, with $PRIMARY_HOST/$REPLICA_HOST/$DBUSER/$DBPASS resolved from db-config.php:
+mysql -h "$PRIMARY_HOST" -u "$DBUSER" -p"$DBPASS" -e "SHOW GLOBAL STATUS LIKE 'Com_select';"
+mysql -h "$REPLICA_HOST" -u "$DBUSER" -p"$DBPASS" -e "SHOW GLOBAL STATUS LIKE 'Com_select';"
+
+for i in $(seq 1 15); do curl -s -o /dev/null http://localhost/; done
+
+# re-run both SHOW GLOBAL STATUS commands - the replica's counter should jump by roughly
+# (requests × queries-per-page), the primary's should barely move (background noise only)
+```
+
+Live result from this exact test: replica `Com_select` +399 across 15 requests (~27 SELECT queries per WordPress page load), primary +1. Confirms reads are genuinely landing on the replica, not just configured to.
+
+To prove writes land on the primary specifically (not just "the site works"), the decisive test isn't watching counters move together — replication makes the replica's write-related counters move too, just from applying the primary's binlog, which looks identical to a real routing bug at a glance. The actual proof is trying to write to the replica directly and confirming it's rejected:
+
+```bash
+mysql -h "$REPLICA_HOST" -u "$DBUSER" -p"$DBPASS" "$DBNAME" -e "INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('should_fail_test', 'x', 'no');"
+# expected: ERROR 1290 (HY000): The MySQL server is running with the --read-only option ...
+```
+
+If a real `$wpdb` write through WordPress succeeds without error (it does), and a direct write against the replica fails with that exact error, the successful write couldn't have gone anywhere but the primary. This also confirms a fail-safe independent of HyperDB's own config: even a HyperDB misconfiguration couldn't cause a silent write to the replica — it would error loudly instead.
+
+### Known security gaps (not yet remediated — flagged for a decision, not overlooked)
+
+Found during a security architect review of this feature, deliberately left as-is pending a decision rather than fixed silently:
+
+- **Neither RDS instance is encrypted at rest** (`StorageEncrypted: false` on both). Check with `aws rds describe-db-instances --query "DBInstances[].[DBInstanceIdentifier,StorageEncrypted]"`. This predates the replica, but a read replica must match its source's encryption status — so adding the replica locked this gap into two instances instead of one. Remediation requires snapshot → restore-as-encrypted for the primary (a genuinely disruptive operation — new endpoint, same complexity class as the earlier snapshot-restore work in this file), then recreating the replica from the now-encrypted primary.
+- **No TLS enforcement in transit** between the web tier and either RDS instance (`require_secure_transport` unset, using the MySQL 8.0 engine default). Check with `aws rds describe-db-parameters --db-parameter-group-name <group> --query "Parameters[?ParameterName=='require_secure_transport']"`. Partially mitigated by VPC-level network isolation (unreachable from outside the VPC regardless), but doesn't meet defense-in-depth for data-in-transit on its own. Lower-risk to remediate than the encryption gap — a parameter group change plus adding SSL context to the MySQL/HyperDB connections, no instance replacement needed.
 
 ### Known limitation: replication lag
 
