@@ -1,20 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Three-tier web app. Creates a VPC in us-east-1 spanning two Availability
-  Zones, with an Application Load Balancer and an Auto Scaling Group (2-3
-  instances) launching WordPress EC2 instances across two public subnets,
-  a MySQL RDS instance in the private subnet(s), an EFS file system mounted
-  at wp-content on every instance so media uploads and content are shared
-  across the group, a CloudWatch dashboard showing EC2 CPUUtilization, RDS
-  CPUUtilization, and ALB RequestCount, and logging: ALB access logs to S3,
-  each instance's Apache error log and cloud-init output shipped to
-  CloudWatch Logs via the CloudWatch agent, and the RDS error log exported
-  to CloudWatch Logs (with retention set via a small Lambda-backed custom
-  resource, since RDS auto-creates that log group and CloudFormation can't
-  own it directly without risking replacing the database). The database
-  itself remains single-AZ; a second private subnet is included only
-  because RDS requires a DB subnet group to
-  span at least two Availability Zones.
+  Three-tier web app. VPC (us-east-1, two AZs) with an ALB + Auto Scaling
+  Group (2-3 instances) running WordPress across two public subnets, a
+  MySQL RDS primary plus a read replica in the second AZ (WordPress routes
+  writes to the primary and reads to the replica via HyperDB), EFS-shared
+  wp-content, a CloudWatch dashboard, logging (ALB access logs to S3,
+  instance/RDS logs to CloudWatch Logs), and a GitHub Actions deploy role
+  via OIDC. The primary RDS instance is single-AZ; the second private
+  subnet satisfies RDS's multi-AZ subnet-group requirement and hosts the
+  read replica.
 
 Parameters:
   EnvironmentName:
@@ -530,6 +524,7 @@ Resources:
     Type: AWS::EC2::LaunchTemplate
     DependsOn:
       - DBInstance
+      - DBReadReplica
       - EFSMountTarget1
       - EFSMountTarget2
       - HttpdErrorLogGroup
@@ -554,7 +549,7 @@ Resources:
             !Sub |
               #!/bin/bash -xe
               dnf update -y
-              dnf install -y httpd php8.3 php8.3-mysqlnd php8.3-fpm php8.3-gd php8.3-xml php8.3-mbstring mariadb105 amazon-efs-utils amazon-cloudwatch-agent wget
+              dnf install -y httpd php8.3 php8.3-mysqlnd php8.3-fpm php8.3-gd php8.3-xml php8.3-mbstring mariadb105 amazon-efs-utils amazon-cloudwatch-agent wget unzip
 
               mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
               cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWAGENTEOF'
@@ -614,6 +609,36 @@ Resources:
               echo "${EFSFileSystem}:/ /var/www/html/wp-content efs _netdev,tls 0 0" >> /etc/fstab
               mount -a
 
+              cd /tmp
+              wget -q https://downloads.wordpress.org/plugin/hyperdb.zip
+              unzip -q -o hyperdb.zip
+              cp hyperdb/db.php /var/www/html/wp-content/db.php
+
+              cat > /var/www/html/db-config.php <<DBCONFIGEOF
+              <?php
+              \$wpdb->add_database(array(
+                  'host'     => '${DBInstance.Endpoint.Address}',
+                  'user'     => '${DBUsername}',
+                  'password' => '${DBPassword}',
+                  'name'     => '${DBName}',
+                  'write'    => 1,
+                  'read'     => 0,
+                  'dataset'  => 'global',
+                  'timeout'  => 0.2,
+              ));
+
+              \$wpdb->add_database(array(
+                  'host'     => '${DBReadReplica.Endpoint.Address}',
+                  'user'     => '${DBUsername}',
+                  'password' => '${DBPassword}',
+                  'name'     => '${DBName}',
+                  'write'    => 0,
+                  'read'     => 1,
+                  'dataset'  => 'global',
+                  'timeout'  => 0.2,
+              ));
+              DBCONFIGEOF
+
               chown -R apache:apache /var/www/html
               chmod -R 755 /var/www/html
 
@@ -668,6 +693,21 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub ${EnvironmentName}-mysql
+
+  DBReadReplica:
+    Type: AWS::RDS::DBInstance
+    DependsOn: DBInstance
+    Properties:
+      SourceDBInstanceIdentifier: !Ref DBInstance
+      DBInstanceClass: !Ref DBInstanceClass
+      AvailabilityZone: !Ref SecondAvailabilityZone
+      PubliclyAccessible: false
+      StorageType: gp3
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-mysql-read-replica
 
   RdsLogRetentionFunctionRole:
     Type: AWS::IAM::Role
@@ -1023,6 +1063,16 @@ Outputs:
     Value: !GetAtt DBInstance.Endpoint.Port
     Export:
       Name: !Sub ${EnvironmentName}-db-port
+
+  DBReadReplicaEndpoint:
+    Description: RDS read replica connection endpoint (used by WordPress via HyperDB for read queries)
+    Value: !GetAtt DBReadReplica.Endpoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-db-replica-endpoint
+
+  DBReadReplicaPort:
+    Description: RDS read replica connection port
+    Value: !GetAtt DBReadReplica.Endpoint.Port
 
   WebServerSecurityGroupId:
     Description: Security group ID for the WordPress web servers
