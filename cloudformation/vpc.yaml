@@ -581,10 +581,16 @@ Resources:
             - HEAD
           # Managed policy "CachingDisabled" (AWS-account-agnostic, stable ID)
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
-          # Managed policy "AllViewer" - forwards all headers/cookies/query strings to
-          # the origin, since WordPress needs cookies for auth and varies responses by
-          # nearly everything.
-          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+          # Managed policy "AllViewerAndCloudFrontHeaders-2022-06" - forwards all
+          # headers/cookies/query strings to the origin (WordPress needs cookies for
+          # auth and varies responses by nearly everything), plus the CloudFront-*
+          # headers (notably CloudFront-Forwarded-Proto). The origin is HTTP-only
+          # (see OriginProtocolPolicy above), so the standard X-Forwarded-Proto header
+          # the ALB adds always reads "http" - it reflects the CloudFront-to-ALB hop,
+          # not what the viewer actually used. CloudFront-Forwarded-Proto reflects the
+          # viewer's real protocol, which is what wp-config.php checks to avoid an
+          # infinite HTTPS redirect loop on /wp-admin.
+          OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc
         ViewerCertificate:
           CloudFrontDefaultCertificate: true
       Tags:
@@ -743,6 +749,22 @@ Resources:
               sed -i "s/username_here/${DBUsername}/" wp-config.php
               sed -i "s/password_here/${DBPassword}/" wp-config.php
               sed -i "s/localhost/${DBInstance.Endpoint.Address}/" wp-config.php
+
+              # The ALB origin is HTTP-only (see CloudFrontDistribution), so the
+              # X-Forwarded-Proto header it adds always reads "http" - it reflects the
+              # CloudFront-to-ALB hop, not what the viewer actually used. CloudFront
+              # itself only exposes the viewer's real protocol via
+              # CloudFront-Forwarded-Proto, and only when the distribution's origin
+              # request policy forwards CloudFront-* headers. Without this, WordPress
+              # (siteurl/home are https) thinks every request is plain HTTP and
+              # infinitely redirects /wp-admin to itself.
+              cat > /tmp/https-proxy-fix.php <<'PHPSNIPPET'
+              if ( isset( $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] ) && $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https' ) {
+              	$_SERVER['HTTPS'] = 'on';
+              }
+              PHPSNIPPET
+              sed -i "/Add any custom values between this line/r /tmp/https-proxy-fix.php" wp-config.php
+              rm -f /tmp/https-proxy-fix.php
 
               mkdir -p /mnt/efs-seed
               for i in 1 2 3 4 5 6; do
