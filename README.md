@@ -15,6 +15,7 @@ A production-style three-tier web architecture on AWS — WordPress running on a
 - Replacing long-lived AWS credentials with GitHub OIDC role assumption — including tracking down the real cause of a failed `AssumeRoleWithWebIdentity` call via CloudTrail (GitHub's `sub` claim embeds immutable numeric org/repo IDs, not just names)
 - Writing a least-privilege IAM policy for the CI role: scoped to this stack's specific resource ARNs wherever AWS's IAM model supports it, and to a tight action list (not `service:*`) where it doesn't
 - Running a security architect review that found and fixed a real input-validation gap (see [Security review](#security-review) below) rather than declaring victory once the feature merely deployed without errors
+- Enforcing the branch/PR policy at the platform level, not just by convention: a branch protection rule on `main` rejects direct pushes outright and requires the CI lint check to pass and the branch to be up to date before merge is even possible — configured to still let a solo maintainer merge their own reviewed PRs (`required_approving_review_count: 0`) rather than accidentally locking the repo owner out
 - Documenting every failure encountered as it happened — root cause and fix, not just the happy path — in [Deployment.md](Deployment.md)
 
 ## Architecture
@@ -117,15 +118,14 @@ It's an earlier, deliberately simpler snapshot of this project — a VPC, a sing
 
 ## CI/CD pipeline
 
-[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) runs on every push to `main`:
+Two separate workflows, split by trigger — each with its own concurrency scope, so a PR's lint check never has to queue behind an in-progress production deploy:
 
-1. Checks out the repo
-2. Requests a short-lived GitHub OIDC token and assumes `GitHubActionsDeployRole` — no `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` exist anywhere in this repo
-3. Validates the CloudFormation template
-4. Deploys it (`DBPassword`/`KeyPairName` come from GitHub Secrets; every other parameter keeps its current stack value)
-5. Prints the stack outputs
+- [`.github/workflows/validate.yml`](.github/workflows/validate.yml) — every pull request targeting `main`. Lints the CloudFormation template with `cfn-lint`. No AWS credentials at all.
+- [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) — every push to `main` (i.e. after a PR merges). Requests a short-lived GitHub OIDC token, assumes `GitHubActionsDeployRole` (no `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` anywhere in this repo), validates and deploys the stack (`DBPassword`/`KeyPairName` from GitHub Secrets, every other parameter keeps its current value), then prints the stack outputs.
 
-Getting this working for real surfaced two failures worth calling out: the OIDC trust policy initially checked the `sub` claim in the wrong format (missing GitHub's immutable numeric org/repo IDs — found by reading the actual denied request out of CloudTrail, since workflow logs never show token contents), and the IAM policy was initially missing `cloudformation:GetTemplateSummary`, a permission `aws cloudformation deploy` needs internally that isn't part of the change-set API surface its name suggests. Both are documented in detail, with the exact diagnostic commands used, in [Deployment.md](Deployment.md#troubleshooting).
+Merging into `main` is the actual gate, and it's enforced by a **branch protection rule**, not just convention: direct pushes to `main` are rejected outright, the `validate` check must pass before merge is even possible, and the branch must be up to date with `main` first — the last one specifically closes a real gap this project hit once already (two PRs merging out of order, based on a `main` that had already moved, produced a conflict that also silently stopped CI from re-triggering on the second PR until it was rebased).
+
+Getting the OIDC piece working for real surfaced two failures worth calling out: the trust policy initially checked the `sub` claim in the wrong format (missing GitHub's immutable numeric org/repo IDs — found by reading the actual denied request out of CloudTrail, since workflow logs never show token contents), and the IAM policy was initially missing `cloudformation:GetTemplateSummary`, a permission `aws cloudformation deploy` needs internally that isn't part of the change-set API surface its name suggests. Both — plus the full branch protection configuration and the cfn-lint findings hit along the way — are documented in detail, with the exact diagnostic commands used, in [Deployment.md](Deployment.md#troubleshooting).
 
 ## Deploying this yourself
 

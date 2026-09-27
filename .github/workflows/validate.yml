@@ -1,0 +1,49 @@
+name: Validate CloudFormation Template
+
+# Runs on every pull request targeting main. Offline cfn-lint only, no AWS
+# credentials - a pull_request-triggered OIDC token has a different "sub" claim
+# shape than a push (repo:org/repo:pull_request vs. repo:org@id/repo@id:ref:refs/
+# heads/main), which GitHubActionsDeployRole's trust policy (cloudformation/vpc.yaml)
+# deliberately does not authorize, so this workflow intentionally never attempts
+# to assume it.
+#
+# Kept as a separate workflow file (not a job with an `if:` inside deploy.yml) for
+# two reasons: it needs its own concurrency scope - a PR's lint run should never
+# queue behind an in-progress production deploy, since it doesn't touch AWS at all
+# - and this job's name is a required status check in this repo's branch
+# protection rule on main, so it's kept simple and stable rather than living
+# alongside deploy-specific conditionals.
+
+on:
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: cfn-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TEMPLATE_FILE: cloudformation/vpc.yaml
+
+jobs:
+  validate:
+    name: Validate CloudFormation template (cfn-lint)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install cfn-lint
+        run: pip install cfn-lint
+
+      - name: Lint CloudFormation template
+        run: cfn-lint ${{ env.TEMPLATE_FILE }}
