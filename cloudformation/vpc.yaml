@@ -64,11 +64,17 @@ Parameters:
 
   DBPassword:
     Type: String
-    Description: Master password for the RDS instance (8-41 characters, no '/', '@', '"', or spaces).
+    # Excludes: / @ " ' \ and whitespace. The single quote and backslash exclusions
+    # are specifically required by db-config.php's HyperDB setup below, which embeds
+    # this value inside a single-quoted PHP string literal - an unescaped ' would
+    # prematurely close that string (fatal PHP parse error, site-wide outage on the
+    # next instance boot with such a password), and \ can escape the closing quote
+    # in unexpected ways depending on what follows it.
+    Description: Master password for the RDS instance (8-41 characters, no '/', '@', '"', '\'', '\', or spaces).
     NoEcho: true
     MinLength: 8
     MaxLength: 41
-    AllowedPattern: "[^/@\"\\s]*"
+    AllowedPattern: "[^/@\"'\\\\\\s]*"
 
   DBInstanceClass:
     Type: String
