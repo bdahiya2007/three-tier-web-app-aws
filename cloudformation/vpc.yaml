@@ -1,15 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Three-tier web app. VPC (us-east-1, two AZs) with CloudFront (WAF-protected:
-  SQLi + common/XSS managed rules) in front of an ALB + Auto Scaling Group
-  (2-3 instances) running WordPress across two public subnets - the ALB only
-  accepts traffic from CloudFront's IP ranges, not the public internet
-  directly. A MySQL RDS primary plus a read replica in the second AZ
-  (WordPress routes writes to the primary, reads to the replica via HyperDB),
-  EFS-shared wp-content, a CloudWatch dashboard, logging (ALB access logs to
-  S3, instance/RDS logs to CloudWatch Logs), and a GitHub Actions deploy role
-  via OIDC. The primary RDS instance is single-AZ; the second private subnet
-  satisfies RDS's multi-AZ subnet-group requirement and hosts the replica.
+  Three-tier web app. VPC (us-east-1, two AZs) with CloudFront (custom domain, WAF:
+  SQLi + common/XSS rules) in front of an ALB + Auto Scaling Group (2-3 instances)
+  running WordPress across two public subnets - the ALB only accepts traffic from
+  CloudFront's IP ranges, not the public internet directly. A MySQL RDS primary plus
+  a read replica in the second AZ (WordPress routes writes to the primary, reads to
+  the replica via HyperDB), EFS-shared wp-content, a CloudWatch dashboard, logging
+  (ALB access logs to S3, instance/RDS logs to CloudWatch Logs), and a GitHub Actions
+  deploy role via OIDC. The primary RDS instance is single-AZ; the second private
+  subnet satisfies RDS's multi-AZ subnet-group requirement and hosts the replica.
 
 Parameters:
   EnvironmentName:
@@ -147,13 +146,11 @@ Parameters:
     Default: pl-3b927c52
     Description: >-
       AWS-managed prefix list ID for CloudFront's origin-facing IP ranges
-      (com.amazonaws.global.cloudfront.origin-facing). Used to restrict the ALB's
-      security group to CloudFront only, so the WAF Web ACL attached to the
-      CloudFront distribution can't be bypassed by hitting the ALB's DNS name
-      directly. This ID is AWS-managed and consistent across accounts in the
-      standard AWS partition; verify with `aws ec2 describe-managed-prefix-lists
-      --filters Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing`
-      if it's ever in doubt.
+      (com.amazonaws.global.cloudfront.origin-facing). Restricts the ALB's security
+      group to CloudFront only, so its WAF can't be bypassed via the ALB's DNS name
+      directly. Consistent across accounts; verify with `aws ec2
+      describe-managed-prefix-lists --filters
+      Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing`.
 
   CloudFrontPriceClass:
     Type: String
@@ -163,6 +160,22 @@ Parameters:
       - PriceClass_200
       - PriceClass_All
     Description: CloudFront price class. PriceClass_100 (US, Canada, Europe edge locations only) is the cheapest and default here; PriceClass_All adds more edge locations worldwide at higher cost.
+
+  CustomDomainName:
+    Type: String
+    Default: admin.securecloudengineers.com
+    Description: >-
+      Custom domain for CloudFront, alongside its default *.cloudfront.net domain.
+      Must be a subdomain of Route53HostedZoneId's zone; its ACM cert is DNS-validated
+      automatically.
+
+  Route53HostedZoneId:
+    Type: String
+    Default: Z06930743HC9RLGHJO306
+    Description: >-
+      Hosted zone ID for securecloudengineers.com, owned by a separate stack
+      (secure-static-website-aws). Only a new record is added here - the zone
+      itself isn't owned or modified.
 
   GitHubOrg:
     Type: String
@@ -492,12 +505,10 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref ALBTargetGroup
 
-  # A dedicated Web ACL for this project, not the pre-existing "securecloudengineers-waf"
-  # from the other portfolio repo in this account. That one only has the SQLi rule set
-  # (doesn't cover XSS) and is owned/managed by an independent CloudFormation stack -
-  # reusing it here would mean two unrelated stacks fighting over the same resource's
-  # rule list on every update, and coupling this project's security posture to changes
-  # made for an unrelated static site.
+  # A dedicated Web ACL, not the pre-existing "securecloudengineers-waf" from the
+  # other portfolio repo in this account - that one lacks XSS coverage and is owned
+  # by an independent stack, so reusing it would mean two stacks fighting over its
+  # rule list on every update.
   WAFWebACL:
     Type: AWS::WAFv2::WebACL
     Properties:
@@ -539,14 +550,26 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-waf
 
-  # CloudFront in front of the ALB: TLS for viewers (via the default *.cloudfront.net
-  # certificate, no custom domain needed), the WAF Web ACL above, and a pass-through
-  # cache configuration (CachingDisabled + AllViewer origin request policy) since this
-  # is a dynamic WordPress site, not static content - caching GET responses here would
-  # risk serving one visitor's logged-in/session-specific page to another. Enabling real
-  # caching for genuinely static paths (e.g. /wp-content/uploads/*) would be a sensible
-  # future optimization via a path-based cache behavior, out of scope for just adding
-  # WAF protection.
+  # DNS-validated ACM cert for CustomDomainName. Must be in us-east-1 for CloudFront
+  # (this stack already deploys there). HostedZoneId lets CloudFormation create/clean
+  # up the validation CNAME itself - no manual console step.
+  CustomDomainCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref CustomDomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref CustomDomainName
+          HostedZoneId: !Ref Route53HostedZoneId
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-${CustomDomainName}
+
+  # CloudFront in front of the ALB: TLS via CustomDomainCertificate, the WAF Web ACL
+  # above, and a pass-through cache config (CachingDisabled) since this is dynamic
+  # WordPress, not static content - caching GETs risks leaking one visitor's
+  # logged-in/session page to another. Path-based caching for static paths (e.g.
+  # /wp-content/uploads/*) would be a sensible future optimization, out of scope here.
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -556,6 +579,8 @@ Resources:
         PriceClass: !Ref CloudFrontPriceClass
         HttpVersion: http2
         WebACLId: !GetAtt WAFWebACL.Arn
+        Aliases:
+          - !Ref CustomDomainName
         Origins:
           - Id: ALBOrigin
             DomainName: !GetAtt ApplicationLoadBalancer.DNSName
@@ -581,21 +606,43 @@ Resources:
             - HEAD
           # Managed policy "CachingDisabled" (AWS-account-agnostic, stable ID)
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
-          # Managed policy "AllViewerAndCloudFrontHeaders-2022-06" - forwards all
-          # headers/cookies/query strings to the origin (WordPress needs cookies for
-          # auth and varies responses by nearly everything), plus the CloudFront-*
-          # headers (notably CloudFront-Forwarded-Proto). The origin is HTTP-only
-          # (see OriginProtocolPolicy above), so the standard X-Forwarded-Proto header
-          # the ALB adds always reads "http" - it reflects the CloudFront-to-ALB hop,
-          # not what the viewer actually used. CloudFront-Forwarded-Proto reflects the
-          # viewer's real protocol, which is what wp-config.php checks to avoid an
-          # infinite HTTPS redirect loop on /wp-admin.
+          # "AllViewerAndCloudFrontHeaders-2022-06" - forwards all viewer headers/
+          # cookies/query strings plus CloudFront-* headers (CloudFront-Forwarded-Proto
+          # is what wp-config.php uses to avoid an /wp-admin redirect loop; see UserData).
           OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc
         ViewerCertificate:
-          CloudFrontDefaultCertificate: true
+          AcmCertificateArn: !Ref CustomDomainCertificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
       Tags:
         - Key: Name
           Value: !Sub ${EnvironmentName}-cloudfront
+
+  # A + AAAA alias records for CustomDomainName - a new record, not a modification of
+  # the zone's existing ones, so no cross-stack ownership conflict (unlike the WAF ACL).
+  CustomDomainDNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref Route53HostedZoneId
+      Name: !Ref CustomDomainName
+      Type: A
+      AliasTarget:
+        # Fixed, AWS-wide hosted zone ID for any CloudFront distribution as an alias
+        # target - not specific to this account or distribution.
+        HostedZoneId: Z2FDTNDATAQYW2
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        EvaluateTargetHealth: false
+
+  CustomDomainDNSRecordIPv6:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref Route53HostedZoneId
+      Name: !Ref CustomDomainName
+      Type: AAAA
+      AliasTarget:
+        HostedZoneId: Z2FDTNDATAQYW2
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        EvaluateTargetHealth: false
 
   EFSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -750,14 +797,10 @@ Resources:
               sed -i "s/password_here/${DBPassword}/" wp-config.php
               sed -i "s/localhost/${DBInstance.Endpoint.Address}/" wp-config.php
 
-              # The ALB origin is HTTP-only (see CloudFrontDistribution), so the
-              # X-Forwarded-Proto header it adds always reads "http" - it reflects the
-              # CloudFront-to-ALB hop, not what the viewer actually used. CloudFront
-              # itself only exposes the viewer's real protocol via
-              # CloudFront-Forwarded-Proto, and only when the distribution's origin
-              # request policy forwards CloudFront-* headers. Without this, WordPress
-              # (siteurl/home are https) thinks every request is plain HTTP and
-              # infinitely redirects /wp-admin to itself.
+              # ALB origin is HTTP-only, so X-Forwarded-Proto always reads "http" (the
+              # CloudFront-to-ALB hop, not what the viewer used). CloudFront-Forwarded-Proto
+              # carries the viewer's real protocol instead - without this, WordPress
+              # thinks every request is HTTP and infinitely redirects /wp-admin to itself.
               cat > /tmp/https-proxy-fix.php <<'PHPSNIPPET'
               if ( isset( $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] ) && $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https' ) {
               	$_SERVER['HTTPS'] = 'on';
@@ -1063,6 +1106,7 @@ Resources:
                   - cloudwatch:*
                   - cloudfront:*
                   - wafv2:*
+                  - acm:*
                   - lambda:CreateFunction
                   - lambda:UpdateFunctionCode
                   - lambda:UpdateFunctionConfiguration
@@ -1095,6 +1139,22 @@ Resources:
                   - s3:GetBucketTagging
                 Resource:
                   - arn:aws:s3:::three-tier-app-network-*
+              # Scoped to just this one hosted zone (owned by a separate stack) -
+              # GetChange's change IDs are account-global, so it needs Resource: "*".
+              - Sid: Route53ScopedToCustomDomainZone
+                Effect: Allow
+                Action:
+                  - route53:GetHostedZone
+                  - route53:ListResourceRecordSets
+                  - route53:ChangeResourceRecordSets
+                Resource:
+                  - !Sub arn:aws:route53:::hostedzone/${Route53HostedZoneId}
+              - Sid: Route53GetChangeIsAccountGlobal
+                Effect: Allow
+                Action:
+                  - route53:GetChange
+                Resource:
+                  - "*"
               # IAM: kept the tightest of all, since over-broad IAM permissions on a CI role is a
               # privilege-escalation risk. Scoped to only the role/instance-profile names this stack creates.
               - Sid: IamScopedToThisStacksRoles
@@ -1279,7 +1339,7 @@ Outputs:
     Value: !Ref WebServerAutoScalingGroup
 
   CloudFrontDomainName:
-    Description: CloudFront distribution domain name
+    Description: CloudFront distribution's default domain name (*.cloudfront.net) - kept reachable alongside the custom domain
     Value: !GetAtt CloudFrontDistribution.DomainName
 
   CloudFrontDistributionId:
@@ -1290,9 +1350,13 @@ Outputs:
     Description: ARN of the WAF Web ACL attached to the CloudFront distribution
     Value: !GetAtt WAFWebACL.Arn
 
+  CustomDomainCertificateArn:
+    Description: ARN of the ACM certificate issued for CustomDomainName
+    Value: !Ref CustomDomainCertificate
+
   WordPressURL:
-    Description: URL to access the WordPress site (via CloudFront + WAF, not the ALB directly)
-    Value: !Sub https://${CloudFrontDistribution.DomainName}
+    Description: URL to access the WordPress site (custom domain, via CloudFront + WAF)
+    Value: !Sub https://${CustomDomainName}
 
   EFSFileSystemId:
     Description: EFS file system ID (mounted at /var/www/html/wp-content on every instance)
