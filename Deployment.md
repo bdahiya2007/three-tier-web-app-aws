@@ -1,6 +1,6 @@
 # Deployment
 
-Commands for deploying the full CloudFormation stack for the three-tier web app: a VPC spanning two Availability Zones, a MySQL RDS primary plus a read replica in the second AZ (WordPress routes writes to the primary and reads to the replica via the HyperDB drop-in), an Application Load Balancer + Auto Scaling Group (2-3 instances by default) launching WordPress EC2 instances (Amazon Linux 2023, PHP 8.3, Apache) across two public subnets, an EFS file system mounted at `wp-content` on every instance so uploads/themes/plugins are shared across the group, a CloudWatch dashboard (EC2/RDS CPU, ALB request count), and logging (ALB access logs to S3, instance logs + RDS error log to CloudWatch Logs). Assumes AWS CLI v2 is installed and credentials are configured (`aws configure` or an active SSO/profile session) with permission to create VPC, RDS, EC2, ELBv2, EFS, IAM, S3, CloudWatch, and Auto Scaling resources.
+Commands for deploying the full CloudFormation stack for the three-tier web app: a VPC spanning two Availability Zones, CloudFront (with a dedicated WAF Web ACL — SQLi and XSS managed rules) in front of an Application Load Balancer + Auto Scaling Group (2-3 instances by default, the ALB restricted to CloudFront's IP ranges only) launching WordPress EC2 instances (Amazon Linux 2023, PHP 8.3, Apache) across two public subnets, a MySQL RDS primary plus a read replica in the second AZ (WordPress routes writes to the primary and reads to the replica via the HyperDB drop-in), an EFS file system mounted at `wp-content` on every instance so uploads/themes/plugins are shared across the group, a CloudWatch dashboard (EC2/RDS CPU, ALB request count), and logging (ALB access logs to S3, instance logs + RDS error log to CloudWatch Logs). Assumes AWS CLI v2 is installed and credentials are configured (`aws configure` or an active SSO/profile session) with permission to create VPC, RDS, EC2, ELBv2, EFS, IAM, S3, CloudWatch, CloudFront, WAF, and Auto Scaling resources.
 
 **Every `deploy` command below needs `--capabilities CAPABILITY_NAMED_IAM`** — the stack creates a named IAM role (`CloudWatchAgentRole`, for the CloudWatch agent on each instance), and CloudFormation refuses to create/update IAM resources without this explicit acknowledgment. Omitting it fails with `Requires capabilities : [CAPABILITY_NAMED_IAM]`.
 
@@ -291,7 +291,7 @@ aws cloudformation describe-stacks \
   --query "Stacks[0].StackStatus"
 ```
 
-## View stack outputs (VPC ID, subnet IDs, route table IDs, RDS endpoint, ALB DNS name, EFS file system ID, CloudWatch dashboard URL, ALB logs bucket, log group names, WordPress URL)
+## View stack outputs (VPC ID, subnet IDs, route table IDs, RDS endpoint, ALB DNS name, CloudFront domain, WAF Web ACL ARN, EFS file system ID, CloudWatch dashboard URL, ALB logs bucket, log group names, WordPress URL)
 
 ```bash
 aws cloudformation describe-stacks \
@@ -448,7 +448,7 @@ If step 1 shows no streams (empty result) after an instance has been running a f
 
 ## Access the WordPress site
 
-Once the stack finishes and each instance's `UserData` script completes (allow a few extra minutes after `UPDATE_COMPLETE`/`CREATE_COMPLETE` for WordPress to install and the ALB target group health checks to pass), open the `WordPressURL` output value in a browser to run the WordPress setup wizard.
+Once the stack finishes and each instance's `UserData` script completes (allow a few extra minutes after `UPDATE_COMPLETE`/`CREATE_COMPLETE` for WordPress to install and the ALB target group health checks to pass), open the `WordPressURL` output value in a browser to run the WordPress setup wizard. `WordPressURL` is the **CloudFront** domain, not the ALB directly — see "CloudFront and WAF" below for why. CloudFront distribution changes also need extra time beyond the CloudFormation stack reaching `UPDATE_COMPLETE`/`CREATE_COMPLETE` (typically 5-15 more minutes) to actually propagate to edge locations worldwide; a `403`/timeout in the first few minutes after a fresh deploy doesn't necessarily mean something's wrong.
 
 Since instances are now managed by an Auto Scaling Group, there's no single stable instance to SSH into. To reach a specific instance for troubleshooting, list the running instances and their public IPs first:
 
@@ -492,6 +492,65 @@ If instance 2 prints `hello-from-instance-1`, the shared mount is working end-to
 ssh -i <your-key-pair-name>.pem ec2-user@<instance-1-public-ip> \
   "sudo rm -f /var/www/html/wp-content/efs-share-test"
 ```
+
+## CloudFront and WAF
+
+CloudFront sits in front of the ALB as the actual public entry point, with a dedicated WAF Web ACL (`WAFWebACL`) attached — AWS managed rule groups `AWSManagedRulesSQLiRuleSet` (SQL injection) and `AWSManagedRulesCommonRuleSet` (includes `CrossSiteScripting_*` rules, among broader OWASP baseline coverage — verified via `aws wafv2 describe-managed-rule-group` rather than assumed from the rule group's name).
+
+**Cost added**: WAF has a flat ~$5/month Web ACL fee plus ~$1/month per rule group (2 here, ~$7/month total) plus a small per-million-requests charge; CloudFront itself is likely near-free at this project's traffic level (within or close to its own free tier for data transfer/requests). Brings the running total from the earlier ~$50-54/month estimate to roughly **$57-61/month**.
+
+### Why not reuse the existing WAF Web ACL from the other portfolio project
+
+This account already has a Web ACL (`securecloudengineers-waf`) from the `secure-static-website-aws` repo. Deliberately not reused here:
+- It only has the SQLi rule set — no XSS coverage, so reusing it as-is wouldn't fully satisfy the requirement.
+- It's owned and managed by an **independent CloudFormation stack**. A resource can only be "owned" by one stack; referencing/importing it into this template would mean two unrelated stacks fighting over its `Rules` list on every future update — CloudFormation treats `Rules` as the complete authoritative list, so an update to either stack would silently overwrite whatever the other one expects.
+- Adding the missing XSS rule to it via a one-off AWS CLI call (bypassing CloudFormation) would work briefly, then get silently reverted the next time that *other* project's stack does any unrelated update.
+- Sharing one Web ACL couples two otherwise-independent projects' security posture and mixes their WAF metrics/logs together.
+
+This template creates its own dedicated `WAFWebACL`, scoped only to this project's CloudFront distribution.
+
+### Why the ALB is now locked down to CloudFront's IP ranges only
+
+`ALBSecurityGroupIngressFromCloudFront` restricts the ALB's security group to the AWS-managed prefix list `com.amazonaws.global.cloudfront.origin-facing` (`CloudFrontOriginFacingPrefixListId`, default `pl-3b927c52`) instead of `0.0.0.0/0`. Without this, the WAF protection would be purely cosmetic — anyone could bypass CloudFront (and its WAF) entirely by hitting the ALB's DNS name directly on port 80. This is a real, load-bearing part of "attach a WAF," not an optional hardening extra.
+
+**Consequence**: the ALB's DNS name (`LoadBalancerDNSName` output) is no longer reachable from your laptop directly — only from CloudFront's edge network. Every `curl http://<alb-dns-name>` example used earlier in this file (and throughout this project's troubleshooting history) now only works from *inside* an EC2 instance in the VPC, not from an external machine. Use `WordPressURL` (the CloudFront domain) for anything from outside the VPC now.
+
+### Why caching is disabled
+
+`DefaultCacheBehavior` uses the AWS managed `CachingDisabled` policy plus the `AllViewer` origin request policy (forwards all headers/cookies/query strings to the origin). WordPress is a dynamic, session-aware application — caching GET responses at the edge risks serving one visitor's logged-in or nonce-specific page to another visitor entirely. This makes CloudFront function purely as a TLS-termination + WAF-enforcement layer for now, not a performance cache. Adding real caching for genuinely static paths (e.g. `/wp-content/uploads/*`) via a path-based cache behavior would be a sensible next step, out of scope for just adding WAF protection.
+
+### After deploying: fix `wp_options` again
+
+Same issue as every previous change to the public entry point (see "WordPress login/internal links go to a dead URL" in Troubleshooting) — WordPress's `siteurl`/`home` database values still point at whatever URL was used during the last setup/fix, which is now stale (the ALB URL, not the CloudFront domain). Update them the same way as before, using the new `WordPressURL` (CloudFront) value:
+
+```sql
+UPDATE wp_options SET option_value="<current-WordPressURL-output>" WHERE option_name IN ("siteurl","home");
+```
+
+### Verify the WAF is actually blocking attacks (not just attached)
+
+Same principle as everywhere else in this file — attached and configured isn't the same as actually working. Send requests that AWS's managed rule groups are documented to match, and confirm they're blocked (`403`), while a normal request still succeeds:
+
+```bash
+# Normal request - should succeed (200)
+curl -s -o /dev/null -w "Normal request: %{http_code}\n" "https://<cloudfront-domain>/"
+
+# SQL injection pattern in a query string - should be blocked (403) by AWSManagedRulesSQLiRuleSet
+curl -s -o /dev/null -w "SQLi pattern: %{http_code}\n" "https://<cloudfront-domain>/?id=1' OR '1'='1"
+
+# XSS pattern in a query string - should be blocked (403) by AWSManagedRulesCommonRuleSet's CrossSiteScripting_QUERYARGUMENTS rule
+curl -s -o /dev/null -w "XSS pattern: %{http_code}\n" "https://<cloudfront-domain>/?q=<script>alert(1)</script>"
+```
+
+If the SQLi/XSS requests return `200` instead of `403`, the rules aren't actually active — check `aws wafv2 get-web-acl` for the current rule list and `aws cloudwatch get-metric-statistics` against the `${EnvironmentName}-waf-sqli`/`${EnvironmentName}-waf-common` metrics (from each rule's `VisibilityConfig`) to confirm the rule groups are receiving and evaluating traffic at all.
+
+### Verify direct ALB access is actually blocked (the bypass is actually closed)
+
+```bash
+curl -s -o /dev/null -w "Direct ALB access: %{http_code}\n" --max-time 10 "http://<alb-dns-name>/"
+```
+
+Expect a timeout (`000` from curl, no HTTP status at all) — a silent connection drop, the signature of a security-group-level block, not a clean rejection. If this instead returns any real HTTP status, the ALB is still directly reachable and the WAF is being bypassed.
 
 ## Connect to the RDS database
 
@@ -659,6 +718,13 @@ Same rule as any other `UserData` change: a stack update alone doesn't touch alr
 ## Troubleshooting
 
 Every issue actually hit while building and operating this stack, with symptom → cause → fix. Check here first before re-diagnosing from scratch.
+
+### CloudFormation fails: "Invalid rule description. Valid descriptions are strings less than 256 characters from the following set: ..."
+
+- **Symptom**: `AWS::EC2::SecurityGroupIngress` (or an inline `SecurityGroupIngress` entry) fails to create with this exact message, listing an allowed character set.
+- **Cause**: EC2 security group rule `Description` fields only accept a specific character set — notably **no apostrophe**. `HTTP access from CloudFront's origin-facing IP ranges only` failed for exactly this reason (the `'` in "CloudFront's"). Easy to miss since apostrophes look completely ordinary in prose, and most other AWS string fields (tags, resource descriptions elsewhere in this same template) don't have this restriction.
+- **Fix**: Reword to avoid the character entirely (`CloudFront origin-facing IP ranges` instead of `CloudFront's origin-facing IP ranges`) rather than trying to escape it — the allowed set has no escape mechanism, the character simply isn't permitted.
+- **General lesson**: this specific field has a narrower allowed character set than most other AWS string properties. Worth a second look at rule/security-group `Description` text specifically (not just parameter values, which is where the previous "excludes `'`" lesson from `DBPassword` came from) before assuming any plain English sentence is safe to use verbatim.
 
 ### GitHub Actions OIDC: "Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity"
 
@@ -916,7 +982,7 @@ No AWS access key/secret key secrets exist at all with this approach — a role 
 
 Scoped deliberately, not a broad managed policy:
 - **CloudFormation** actions restricted to this one stack's ARN (`stack/three-tier-app-network/*`); `ValidateTemplate` is separate since that action has no resource-level permission support.
-- **EC2, Auto Scaling, RDS, ELBv2, EFS, Logs, CloudWatch, Lambda, SSM**: action list scoped to only what a deploy needs (not `service:*` wildcards, except where AWS groups related actions like `autoscaling:*`/`rds:*`/`elasticfilesystem:*` themselves) — but on `Resource: "*"`, since most of these create/describe/modify actions genuinely don't support resource-level ARN restriction in AWS's own IAM implementation (a documented AWS limitation, not a shortcut here).
+- **EC2, Auto Scaling, RDS, ELBv2, EFS, Logs, CloudWatch, Lambda, SSM, CloudFront, WAFv2**: action list scoped to only what a deploy needs (not `service:*` wildcards, except where AWS groups related actions like `autoscaling:*`/`rds:*`/`elasticfilesystem:*`/`cloudfront:*`/`wafv2:*` themselves) — but on `Resource: "*"`, since most of these create/describe/modify actions genuinely don't support resource-level ARN restriction in AWS's own IAM implementation (a documented AWS limitation, not a shortcut here).
 - **S3**: restricted to bucket names starting with `three-tier-app-network-` (this stack's naming convention for the ALB logs bucket).
 - **IAM**: the tightest of all, since over-broad IAM permissions on a CI role is a privilege-escalation risk — restricted to role/instance-profile ARNs starting with `three-tier-app-` (this stack's own resources only, including the role itself, so future deploys can still update its own permissions).
 

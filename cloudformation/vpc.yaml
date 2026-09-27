@@ -1,14 +1,15 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Three-tier web app. VPC (us-east-1, two AZs) with an ALB + Auto Scaling
-  Group (2-3 instances) running WordPress across two public subnets, a
-  MySQL RDS primary plus a read replica in the second AZ (WordPress routes
-  writes to the primary and reads to the replica via HyperDB), EFS-shared
-  wp-content, a CloudWatch dashboard, logging (ALB access logs to S3,
-  instance/RDS logs to CloudWatch Logs), and a GitHub Actions deploy role
-  via OIDC. The primary RDS instance is single-AZ; the second private
-  subnet satisfies RDS's multi-AZ subnet-group requirement and hosts the
-  read replica.
+  Three-tier web app. VPC (us-east-1, two AZs) with CloudFront (WAF-protected:
+  SQLi + common/XSS managed rules) in front of an ALB + Auto Scaling Group
+  (2-3 instances) running WordPress across two public subnets - the ALB only
+  accepts traffic from CloudFront's IP ranges, not the public internet
+  directly. A MySQL RDS primary plus a read replica in the second AZ
+  (WordPress routes writes to the primary, reads to the replica via HyperDB),
+  EFS-shared wp-content, a CloudWatch dashboard, logging (ALB access logs to
+  S3, instance/RDS logs to CloudWatch Logs), and a GitHub Actions deploy role
+  via OIDC. The primary RDS instance is single-AZ; the second private subnet
+  satisfies RDS's multi-AZ subnet-group requirement and hosts the replica.
 
 Parameters:
   EnvironmentName:
@@ -140,6 +141,28 @@ Parameters:
     Type: Number
     Default: 7
     Description: Retention period (days) for CloudWatch Logs log groups (instance and RDS logs). Kept short by default to minimize cost.
+
+  CloudFrontOriginFacingPrefixListId:
+    Type: String
+    Default: pl-3b927c52
+    Description: >-
+      AWS-managed prefix list ID for CloudFront's origin-facing IP ranges
+      (com.amazonaws.global.cloudfront.origin-facing). Used to restrict the ALB's
+      security group to CloudFront only, so the WAF Web ACL attached to the
+      CloudFront distribution can't be bypassed by hitting the ALB's DNS name
+      directly. This ID is AWS-managed and consistent across accounts in the
+      standard AWS partition; verify with `aws ec2 describe-managed-prefix-lists
+      --filters Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing`
+      if it's ever in doubt.
+
+  CloudFrontPriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues:
+      - PriceClass_100
+      - PriceClass_200
+      - PriceClass_All
+    Description: CloudFront price class. PriceClass_100 (US, Canada, Europe edge locations only) is the cheapest and default here; PriceClass_All adds more edge locations worldwide at higher cost.
 
   GitHubOrg:
     Type: String
@@ -339,17 +362,35 @@ Resources:
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
+      # Ingress is added below via a separate AWS::EC2::SecurityGroupIngress
+      # resource, not inline here - the inline SecurityGroupIngress property on
+      # AWS::EC2::SecurityGroup doesn't support SourcePrefixListId, only the
+      # standalone resource type does.
+      # Left as the original text deliberately: GroupDescription is immutable, and
+      # changing it would force CloudFormation to replace this security group
+      # (recreate + re-associate with the ALB and every SG that references it) just
+      # for a cosmetic wording update. The real restriction is in the separate
+      # ALBSecurityGroupIngressFromCloudFront resource below.
       GroupDescription: Allow HTTP access to the Application Load Balancer
       VpcId: !Ref VPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          CidrIp: 0.0.0.0/0
-          Description: HTTP access from anywhere
       Tags:
         - Key: Name
           Value: !Sub ${EnvironmentName}-alb-sg
+
+  ALBSecurityGroupIngressFromCloudFront:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      # Only CloudFront's origin-facing IP ranges may reach the ALB directly - the
+      # public entry point is the CloudFront distribution (WAF-protected) below.
+      # Without this restriction, anyone could bypass CloudFront and its WAF Web
+      # ACL entirely by hitting the ALB's DNS name on port 80 directly, making the
+      # WAF protection purely cosmetic.
+      GroupId: !Ref ALBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourcePrefixListId: !Ref CloudFrontOriginFacingPrefixListId
+      Description: HTTP access from CloudFront origin-facing IP ranges only
 
   ALBLogsBucket:
     Type: AWS::S3::Bucket
@@ -450,6 +491,105 @@ Resources:
       DefaultActions:
         - Type: forward
           TargetGroupArn: !Ref ALBTargetGroup
+
+  # A dedicated Web ACL for this project, not the pre-existing "securecloudengineers-waf"
+  # from the other portfolio repo in this account. That one only has the SQLi rule set
+  # (doesn't cover XSS) and is owned/managed by an independent CloudFormation stack -
+  # reusing it here would mean two unrelated stacks fighting over the same resource's
+  # rule list on every update, and coupling this project's security posture to changes
+  # made for an unrelated static site.
+  WAFWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${EnvironmentName}-waf
+      Description: !Sub Web ACL for ${EnvironmentName} CloudFront distribution - SQL injection and XSS protection
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${EnvironmentName}-waf
+      Rules:
+        - Name: AWS-AWSManagedRulesSQLiRuleSet
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${EnvironmentName}-waf-sqli
+        - Name: AWS-AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${EnvironmentName}-waf-common
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-waf
+
+  # CloudFront in front of the ALB: TLS for viewers (via the default *.cloudfront.net
+  # certificate, no custom domain needed), the WAF Web ACL above, and a pass-through
+  # cache configuration (CachingDisabled + AllViewer origin request policy) since this
+  # is a dynamic WordPress site, not static content - caching GET responses here would
+  # risk serving one visitor's logged-in/session-specific page to another. Enabling real
+  # caching for genuinely static paths (e.g. /wp-content/uploads/*) would be a sensible
+  # future optimization via a path-based cache behavior, out of scope for just adding
+  # WAF protection.
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub ${EnvironmentName} WordPress site, fronted by WAF
+        PriceClass: !Ref CloudFrontPriceClass
+        HttpVersion: http2
+        WebACLId: !GetAtt WAFWebACL.Arn
+        Origins:
+          - Id: ALBOrigin
+            DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: ALBOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          # Managed policy "CachingDisabled" (AWS-account-agnostic, stable ID)
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # Managed policy "AllViewer" - forwards all headers/cookies/query strings to
+          # the origin, since WordPress needs cookies for auth and varies responses by
+          # nearly everything.
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-cloudfront
 
   EFSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -899,6 +1039,8 @@ Resources:
                   - elasticfilesystem:*
                   - logs:*
                   - cloudwatch:*
+                  - cloudfront:*
+                  - wafv2:*
                   - lambda:CreateFunction
                   - lambda:UpdateFunctionCode
                   - lambda:UpdateFunctionConfiguration
@@ -1107,16 +1249,28 @@ Outputs:
       Name: !Sub ${EnvironmentName}-alb-sg-id
 
   LoadBalancerDNSName:
-    Description: Public DNS name of the Application Load Balancer
+    Description: Public DNS name of the Application Load Balancer (no longer directly reachable from the internet - only CloudFront can reach it; kept for reference/troubleshooting, e.g. checking target health)
     Value: !GetAtt ApplicationLoadBalancer.DNSName
 
   AutoScalingGroupName:
     Description: Name of the WordPress Auto Scaling Group
     Value: !Ref WebServerAutoScalingGroup
 
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref CloudFrontDistribution
+
+  WAFWebACLArn:
+    Description: ARN of the WAF Web ACL attached to the CloudFront distribution
+    Value: !GetAtt WAFWebACL.Arn
+
   WordPressURL:
-    Description: URL to access the WordPress site
-    Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+    Description: URL to access the WordPress site (via CloudFront + WAF, not the ALB directly)
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
 
   EFSFileSystemId:
     Description: EFS file system ID (mounted at /var/www/html/wp-content on every instance)

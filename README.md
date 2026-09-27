@@ -2,11 +2,13 @@
 
 [![Deploy CloudFormation Stack](https://github.com/bdahiya2007/three-tier-web-app-aws/actions/workflows/deploy.yml/badge.svg)](https://github.com/bdahiya2007/three-tier-web-app-aws/actions/workflows/deploy.yml)
 
-A production-style three-tier web architecture on AWS — WordPress running on a horizontally-scaled, self-healing web tier, backed by a database that's never directly reachable and splits reads across a cross-AZ read replica, with shared state, full observability, a CI/CD pipeline authenticated via GitHub OIDC (no long-lived AWS credentials), and a documented security review. Not persistently hosted at a public URL — the ALB's DNS name isn't stable across a stack teardown/recreate, and a public WordPress admin login isn't something worth leaving exposed indefinitely for a demo. Deployable on demand; see [Deploying this yourself](#deploying-this-yourself).
+A production-style three-tier web architecture on AWS — WordPress running behind CloudFront and a dedicated WAF Web ACL, on a horizontally-scaled, self-healing web tier that isn't even reachable except through that edge layer, backed by a database that's never directly reachable and splits reads across a cross-AZ read replica, with shared state, full observability, a CI/CD pipeline authenticated via GitHub OIDC (no long-lived AWS credentials), and a documented security review. Not persistently hosted at a public URL — the CloudFront domain isn't stable across a stack teardown/recreate, and a public WordPress admin login isn't something worth leaving exposed indefinitely for a demo. Deployable on demand; see [Deploying this yourself](#deploying-this-yourself).
 
 ## What this demonstrates
 
 - Designing a three-tier architecture where the data tier (RDS) is never publicly reachable — only the web tier's security group can reach it, on the database port, nothing else
+- Making a considered build-vs-reuse call on a pre-existing WAF Web ACL from another project in the same account: identifying that reusing it would create cross-stack ownership conflicts and only covers half the requirement (SQLi, not XSS), then building a dedicated one instead of forcing a reuse that looked convenient but wasn't sound
+- Actually closing the bypass a WAF alone doesn't: restricting the ALB's security group to CloudFront's own IP range (an AWS-managed prefix list), since a WAF attached only to CloudFront does nothing if the origin behind it is still directly reachable from the internet
 - Building for horizontal scale and resilience: an Auto Scaling Group (2-3 instances) across two Availability Zones behind an Application Load Balancer, with shared state (EFS) so any instance can serve any request identically
 - Read/write splitting with a cross-AZ RDS read replica and the HyperDB drop-in — and *proving* it, not just configuring it: measured live `Com_select` counters to confirm reads actually hit the replica (+399 vs. +1 background noise across 15 requests), then confirmed a real WordPress write succeeds only because it reaches the primary, by separately proving a direct write against the replica fails (`read_only` enforced)
 - Recovering from a real failure end-to-end: restoring RDS from a snapshot after the original stack was deliberately deleted, including the specific quirks of a MySQL snapshot restore (`DBName` rejected by the API, master password never carried over from a snapshot)
@@ -23,10 +25,12 @@ A production-style three-tier web architecture on AWS — WordPress running on a
 ```mermaid
 flowchart TB
     Internet((Internet))
+    WAF[AWS WAF Web ACL<br/>SQLi + Common/XSS managed rules]
+    CF[CloudFront Distribution]
 
     subgraph VPC["VPC — 10.0.0.0/16"]
         subgraph Public["Public subnets (us-east-1a + us-east-1b)"]
-            ALB[Application Load Balancer]
+            ALB["Application Load Balancer<br/>only accepts traffic from<br/>CloudFront's IP range"]
             ASG["Auto Scaling Group<br/>WordPress on EC2<br/>Amazon Linux 2023, PHP 8.3<br/>2-3 instances"]
         end
         subgraph Private["Private subnets (us-east-1a + us-east-1b)"]
@@ -36,7 +40,9 @@ flowchart TB
         EFS[("EFS<br/>shared wp-content")]
     end
 
-    Internet -->|HTTP| ALB
+    Internet -->|HTTPS| CF
+    WAF -.->|inspects every request| CF
+    CF -->|"HTTP (CloudFront prefix list only)"| ALB
     ALB -->|HTTP, ALB security group only| ASG
     ASG -->|"3306 writes (HyperDB), web-tier SG only"| RDS
     ASG -->|"3306 reads (HyperDB), web-tier SG only"| Replica
@@ -75,6 +81,9 @@ flowchart LR
 | GitHub Actions authenticates via OIDC role assumption, not access keys | No long-lived AWS credentials stored in GitHub at all. The trust policy checks the token's `sub` claim — including GitHub's immutable numeric org/repo IDs, not just the names — against this exact repository and branch |
 | CI role's IAM policy: tight action lists on `Resource: "*"` for most infrastructure services, ARN-scoped for IAM and S3 | Most EC2/RDS/ELB/EFS/Lambda create-and-describe actions don't support resource-level ARN restriction in AWS's own IAM model — scope is enforced via the action list instead. IAM permissions are the tightest of all, since over-broad IAM permissions on a CI role is a privilege-escalation risk |
 | Snapshot restore is parameter-driven (`DBSnapshotIdentifier`), not a separate template | The same template can either create a fresh database or restore a prior one, decided at deploy time — used for real after the stack was deliberately deleted and needed its WordPress content back |
+| A new, dedicated WAF Web ACL, not the one already in this account from another project | The existing ACL only covers SQLi (not XSS) and is owned by an independent CloudFormation stack — importing or modifying it would mean two unrelated stacks fighting over its rule list on every future update, and would couple this project's security posture to an unrelated site's |
+| ALB security group restricted to CloudFront's IP range (AWS-managed prefix list), not `0.0.0.0/0` | A WAF attached only to CloudFront protects nothing if the origin behind it is still directly reachable — this is what actually makes the WAF's protection real instead of bypassable |
+| CloudFront caching disabled (`CachingDisabled` + `AllViewer` policies) rather than enabled by default | WordPress is a dynamic, session-aware application; caching GET responses at the edge risks serving one visitor's logged-in page to another. CloudFront here is a TLS-termination + WAF-enforcement layer, not a performance cache — real caching for static paths would be a deliberate follow-up, not a default |
 | Read replica placed via an explicit `AvailabilityZone`, reusing the same security group as the primary | A different AZ than the primary gives it independent power/network/hardware fault domains; sharing the primary's security group is a deliberate simplification since both serve the identical consumer (the web tier) with the identical access pattern — no reason to duplicate the rule set |
 | Read/write splitting via HyperDB (a WordPress drop-in) rather than at the infrastructure layer (e.g. a proxy) | WordPress core has no native concept of a read replica — every query goes wherever `DB_HOST` points. HyperDB intercepts at the `wpdb` layer instead, which is the standard, Automattic-maintained way to do this for WordPress specifically, rather than introducing a separate proxy component (e.g. ProxySQL) this project doesn't otherwise need |
 | `DBPassword`'s `AllowedPattern` excludes `'` and `\`, not just `/`, `@`, `"`, and whitespace | Found during a security review: `db-config.php` embeds the password inside a single-quoted PHP string literal, so an unescaped `'` in a chosen password would cause a fatal PHP parse error on every instance boot — a self-inflicted outage from an otherwise-valid password. The older `wp-config.php` `sed` substitution wasn't vulnerable to this specific character |
@@ -144,4 +153,4 @@ aws cloudformation deploy \
 
 ## Tech stack
 
-AWS CloudFormation · Amazon VPC · Amazon EC2 (Auto Scaling, Launch Templates) · Elastic Load Balancing (Application Load Balancer) · Amazon RDS (MySQL, read replica) · HyperDB (WordPress read/write DB splitting) · Amazon EFS · AWS Lambda (custom resource) · Amazon CloudWatch (Dashboards, Logs) · AWS IAM (OIDC federation) · Amazon S3 · Amazon Linux 2023 · PHP 8.3 · Apache · WordPress · Terraform (baseline alternate path) · GitHub Actions
+AWS CloudFormation · Amazon CloudFront · AWS WAF (managed rule groups) · Amazon VPC · Amazon EC2 (Auto Scaling, Launch Templates) · Elastic Load Balancing (Application Load Balancer) · Amazon RDS (MySQL, read replica) · HyperDB (WordPress read/write DB splitting) · Amazon EFS · AWS Lambda (custom resource) · Amazon CloudWatch (Dashboards, Logs) · AWS IAM (OIDC federation) · Amazon S3 · Amazon Linux 2023 · PHP 8.3 · Apache · WordPress · Terraform (baseline alternate path) · GitHub Actions
