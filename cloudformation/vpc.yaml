@@ -19,12 +19,12 @@ Parameters:
   AvailabilityZone:
     Type: AWS::EC2::AvailabilityZone::Name
     Default: us-east-1a
-    Description: Availability Zone for the public subnet, primary private subnet, and RDS instance.
+    Description: AZ for the public subnet, primary private subnet, and RDS instance.
 
   SecondAvailabilityZone:
     Type: AWS::EC2::AvailabilityZone::Name
     Default: us-east-1b
-    Description: Second AZ, required to satisfy the RDS DB subnet group's multi-AZ requirement.
+    Description: Second AZ, for the RDS DB subnet group's multi-AZ requirement.
 
   VpcCidr:
     Type: String
@@ -64,8 +64,7 @@ Parameters:
 
   DBPassword:
     Type: String
-    # Excludes: / @ " ' \ and whitespace. ' and \ excluded because db-config.php
-    # embeds this in a single-quoted PHP string - an unescaped ' breaks it.
+    # ' and \ excluded: db-config.php embeds this in a single-quoted PHP string.
     Description: Master password for the RDS instance (8-41 chars, no / @ " ' \ or spaces).
     NoEcho: true
     MinLength: 8
@@ -99,19 +98,29 @@ Parameters:
     Default: '7.1'
     Description: Redis engine version for ElastiCache.
 
+  BackupRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Days AWS Backup retains recovery points before deleting them.
+
+  BackupScheduleExpression:
+    Type: String
+    Default: cron(0 5 * * ? *)
+    Description: AWS Backup cron schedule (UTC). Default runs daily at 05:00 UTC.
+
   DBBackupRetentionPeriod:
     Type: Number
     Default: 1
-    Description: Automated backup retention period in days (free-tier accounts are capped at 1).
+    Description: RDS automated backup retention (days); free tier caps this at 1.
 
   DBSnapshotIdentifier:
     Type: String
     Default: ''
-    Description: Optional RDS snapshot identifier to restore the database from instead of creating an empty one. Leave blank for a fresh database. When set, DBUsername must match the snapshot's original master username (the password is not restorable from a snapshot and must be reset afterward via ModifyDBInstance).
+    Description: Optional RDS snapshot to restore from instead of a fresh database. DBUsername must match the snapshot's master username (password isn't restorable, reset via ModifyDBInstance after).
 
   KeyPairName:
     Type: AWS::EC2::KeyPair::KeyName
-    Description: Name of an existing EC2 key pair (in this region) for SSH access to the web server.
+    Description: Name of an existing EC2 key pair for SSH access to the web server.
 
   WebServerInstanceType:
     Type: String
@@ -122,7 +131,7 @@ Parameters:
     Type: String
     Default: 0.0.0.0/0
     AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
-    Description: CIDR block allowed to SSH into the web server. Restrict this to your own IP (e.g. 203.0.113.5/32) instead of leaving it open to the internet.
+    Description: CIDR block allowed to SSH into the web server - restrict to your own IP.
 
   LatestAmiId:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
@@ -165,7 +174,7 @@ Parameters:
       - PriceClass_100
       - PriceClass_200
       - PriceClass_All
-    Description: CloudFront price class. PriceClass_100 (US/Canada/Europe) is cheapest and default; PriceClass_All costs more.
+    Description: CloudFront price class - PriceClass_100 is cheapest/default; PriceClass_All costs more.
 
   CustomDomainName:
     Type: String
@@ -199,7 +208,7 @@ Parameters:
 
   GitHubRepo:
     Type: String
-    Description: GitHub repository name (no owner) allowed to assume the CI deploy role via OIDC.
+    Description: GitHub repository name (no owner) for OIDC trust.
 
   GitHubRepoId:
     Type: String
@@ -210,7 +219,7 @@ Parameters:
   GitHubBranch:
     Type: String
     Default: main
-    Description: Branch allowed to assume the CI deploy role via OIDC. Only pushes to this exact branch can authenticate as this role.
+    Description: Branch allowed to assume the CI deploy role via OIDC.
 
 Conditions:
   RestoreFromSnapshot: !Not [!Equals [!Ref DBSnapshotIdentifier, '']]
@@ -380,7 +389,6 @@ Resources:
   ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      # Ingress added below (inline doesn't support SourcePrefixListId).
       GroupDescription: Allow HTTP access to the Application Load Balancer
       VpcId: !Ref VPC
       Tags:
@@ -390,8 +398,7 @@ Resources:
   ALBSecurityGroupIngressFromCloudFront:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
-      # Only CloudFront's IP ranges may reach the ALB directly - without this, its
-      # WAF could be bypassed entirely via the ALB's DNS name.
+      # Only CloudFront's IPs may reach the ALB - otherwise its WAF is bypassable.
       GroupId: !Ref ALBSecurityGroup
       IpProtocol: tcp
       FromPort: 80
@@ -499,8 +506,6 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref ALBTargetGroup
 
-  # Dedicated Web ACL, not the pre-existing "securecloudengineers-waf" - that one
-  # lacks XSS coverage and is owned by an independent stack.
   WAFWebACL:
     Type: AWS::WAFv2::WebACL
     Properties:
@@ -509,8 +514,7 @@ Resources:
       Scope: CLOUDFRONT
       DefaultAction:
         Allow: {}
-      # Raises body inspection 8KB->64KB so SQLi/XSS rules scan a full post
-      # (pairs with the SizeRestrictions_BODY override below).
+      # Raises body inspection 8KB->64KB (pairs with SizeRestrictions_BODY below).
       AssociationConfig:
         RequestBody:
           CLOUDFRONT:
@@ -540,8 +544,7 @@ Resources:
             ManagedRuleGroupStatement:
               VendorName: AWS
               Name: AWSManagedRulesCommonRuleSet
-              # SizeRestrictions_BODY blocked bodies >8KB, including real posts. Counted
-              # not disabled - stays visible; SQLi/XSS untouched.
+              # SizeRestrictions_BODY blocked real posts too; Counted not disabled.
               RuleActionOverrides:
                 - Name: SizeRestrictions_BODY
                   ActionToUse:
@@ -566,8 +569,6 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-${CustomDomainName}
 
-  # CloudFront in front of the ALB: TLS via CustomDomainCertificate, WAF above, and a
-  # pass-through cache config (CachingDisabled) since this is dynamic WordPress.
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -615,8 +616,6 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-cloudfront
 
-  # A + AAAA alias records for CustomDomainName - new records, not a modification
-  # of the zone's existing ones (unlike the WAF ACL, no cross-stack conflict).
   CustomDomainDNSRecord:
     Type: AWS::Route53::RecordSet
     Properties:
@@ -707,8 +706,6 @@ Resources:
         - !Ref PrivateSubnet
         - !Ref PrivateSubnet2
 
-  # Single node, no Multi-AZ (same tradeoff as RDS primary). Cache data is disposable,
-  # so no encryption/Snapshot policy - see Deployment.md for fallback behavior.
   RedisCluster:
     Type: AWS::ElastiCache::CacheCluster
     Properties:
@@ -758,8 +755,7 @@ Resources:
 
   WebServerLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
-    # DB/Redis/log-group resources omitted: implicit via Ref/GetAtt in UserData
-    # (cfn-lint W3005). EFSMountTarget1/2 aren't referenced there, so still listed.
+    # DB/Redis/log-group resources omitted (implicit via Ref/GetAtt in UserData, cfn-lint W3005).
     DependsOn:
       - EFSMountTarget1
       - EFSMountTarget2
@@ -830,8 +826,7 @@ Resources:
               sed -i "s/password_here/${DBPassword}/" wp-config.php
               sed -i "s/localhost/${DBInstance.Endpoint.Address}/" wp-config.php
 
-              # ALB origin is HTTP-only, so X-Forwarded-Proto always reads "http".
-              # CloudFront-Forwarded-Proto carries the real protocol instead.
+              # ALB is HTTP-only, so X-Forwarded-Proto reads "http" - use CloudFront-Forwarded-Proto.
               cat > /tmp/https-proxy-fix.php <<'PHPSNIPPET'
               if ( isset( $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] ) && $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https' ) {
               	$_SERVER['HTTPS'] = 'on';
@@ -883,8 +878,6 @@ Resources:
               ));
               DBCONFIGEOF
 
-              # Drop-in, same mechanism as db.php above - what the plugin's own
-              # "Enable Object Cache" button does, just automated.
               cd /tmp
               wget -q https://downloads.wordpress.org/plugin/redis-cache.zip
               unzip -q -o redis-cache.zip
@@ -1059,6 +1052,55 @@ Resources:
       LogGroupName: !Sub /aws/rds/instance/${DBInstance}/error
       RetentionInDays: !Ref LogRetentionDays
 
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: !Sub ${EnvironmentName}-backup-vault
+      BackupVaultTags:
+        Name: !Sub ${EnvironmentName}-backup-vault
+
+  BackupServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-backup-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub ${EnvironmentName}-backup-plan
+        BackupPlanRule:
+          - RuleName: Daily
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: !Ref BackupScheduleExpression
+            Lifecycle:
+              DeleteAfterDays: !Ref BackupRetentionDays
+
+  # EC2 by tag (ASG instances get replaced, no fixed ARN); excludes DBReadReplica.
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: !Sub ${EnvironmentName}-backup-selection
+        IamRoleArn: !GetAtt BackupServiceRole.Arn
+        Resources:
+          - !GetAtt DBInstance.DBInstanceArn
+          - !GetAtt EFSFileSystem.Arn
+        ListOfTags:
+          - ConditionType: STRINGEQUALS
+            ConditionKey: Name
+            ConditionValue: !Sub ${EnvironmentName}-wordpress
+
   GitHubActionsDeployRole:
     Type: AWS::IAM::Role
     Properties:
@@ -1079,8 +1121,7 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # CloudFormation actions on this stack; ValidateTemplate is separate
-              # below (no resource-level support).
+              # ValidateTemplate is a separate statement below (no resource-level support).
               - Sid: CloudFormationStackAccess
                 Effect: Allow
                 Action:
@@ -1103,8 +1144,7 @@ Resources:
                 Effect: Allow
                 Action: cloudformation:ValidateTemplate
                 Resource: '*'
-              # Most don't support resource-level IAM for create/describe/modify
-              # (an AWS limitation) - scoped by action list instead.
+              # Most don't support resource-level IAM (AWS limitation) - scoped by action list.
               - Sid: InfrastructureServices
                 Effect: Allow
                 Action:
@@ -1144,6 +1184,7 @@ Resources:
                   - elasticloadbalancing:*
                   - elasticfilesystem:*
                   - elasticache:*
+                  - backup:*
                   - logs:*
                   - cloudwatch:*
                   - cloudfront:*
@@ -1181,8 +1222,7 @@ Resources:
                   - s3:GetBucketTagging
                 Resource:
                   - arn:aws:s3:::three-tier-app-network-*
-              # Scoped to just this hosted zone; GetChange's change IDs are
-              # account-global so it needs Resource: "*".
+              # Scoped to just this zone; GetChange's IDs are account-global -> Resource: "*".
               - Sid: Route53ScopedToCustomDomainZone
                 Effect: Allow
                 Action:
@@ -1197,8 +1237,7 @@ Resources:
                   - route53:GetChange
                 Resource:
                   - "*"
-              # IAM kept tightest of all (privilege-escalation risk) - scoped to just
-              # this stack's own role/instance-profile names.
+              # IAM kept tightest (privilege-escalation risk) - just this stack's own roles.
               - Sid: IamScopedToThisStacksRoles
                 Effect: Allow
                 Action:
@@ -1351,7 +1390,7 @@ Outputs:
       Name: !Sub ${EnvironmentName}-db-port
 
   DBReadReplicaEndpoint:
-    Description: RDS read replica connection endpoint (used by WordPress via HyperDB for read queries)
+    Description: RDS read replica endpoint (used by WordPress via HyperDB for reads)
     Value: !GetAtt DBReadReplica.Endpoint.Address
     Export:
       Name: !Sub ${EnvironmentName}-db-replica-endpoint
@@ -1373,7 +1412,7 @@ Outputs:
       Name: !Sub ${EnvironmentName}-alb-sg-id
 
   LoadBalancerDNSName:
-    Description: Public DNS name of the Application Load Balancer (no longer directly reachable from the internet - only CloudFront can reach it; kept for reference/troubleshooting, e.g. checking target health)
+    Description: Public DNS name of the ALB (not internet-reachable - kept for troubleshooting)
     Value: !GetAtt ApplicationLoadBalancer.DNSName
 
   AutoScalingGroupName:
@@ -1381,7 +1420,7 @@ Outputs:
     Value: !Ref WebServerAutoScalingGroup
 
   CloudFrontDomainName:
-    Description: CloudFront distribution's default domain name (*.cloudfront.net) - kept reachable alongside the custom domain
+    Description: CloudFront's default *.cloudfront.net domain, kept alongside the custom domain
     Value: !GetAtt CloudFrontDistribution.DomainName
 
   CloudFrontDistributionId:
@@ -1415,6 +1454,14 @@ Outputs:
   RedisEndpoint:
     Description: Redis endpoint address used by WordPress as its object cache
     Value: !GetAtt RedisCluster.RedisEndpoint.Address
+
+  BackupVaultName:
+    Description: AWS Backup vault holding daily RDS/EFS/EC2 recovery points
+    Value: !Ref BackupVault
+
+  BackupPlanId:
+    Description: AWS Backup plan ID (daily backups, 30-day retention by default)
+    Value: !GetAtt BackupPlan.BackupPlanId
 
   CloudWatchDashboardURL:
     Description: URL to the CloudWatch dashboard (EC2/RDS CPU, ALB request count)
