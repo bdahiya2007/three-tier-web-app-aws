@@ -708,7 +708,8 @@ Resources:
 
   DBReadReplica:
     Type: AWS::RDS::DBInstance
-    DependsOn: DBInstance
+    # No explicit DependsOn: DBInstance - already enforced implicitly by
+    # !Ref DBInstance in SourceDBInstanceIdentifier below (cfn-lint W3005).
     Properties:
       SourceDBInstanceIdentifier: !Ref DBInstance
       DBInstanceClass: !Ref DBInstanceClass
