@@ -14,7 +14,7 @@ If your account is on the RDS free tier, `DBBackupRetentionPeriod` must stay at 
 
 ## Git workflow: branch, PR, merge — never push directly to `main`
 
-All changes go through a feature branch and a pull request; nothing gets pushed or merged directly to `main`. Since `main` is what the GitHub Actions workflow deploys on every push, this gives every change a review point before it can reach live infrastructure.
+All changes go through a feature branch and a pull request; nothing gets pushed or merged directly to `main`. Since `main` is what the GitHub Actions workflow deploys on every push, this gives every change a review point before it can reach live infrastructure. This is enforced by a branch protection rule on `main` (see "Branch protection on `main`" under "Automated deployment via GitHub Actions" below) — a direct push is rejected by GitHub itself, not just discouraged by convention.
 
 ```bash
 git checkout main && git pull origin main
@@ -829,14 +829,43 @@ See the dedicated "Gotcha: `LatestAmiId` doesn't auto-update just by editing the
 
 ## Automated deployment via GitHub Actions
 
-[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) has two jobs, split by trigger:
+Two fully separate workflow files, split by trigger:
 
-- **`validate`** — runs on every pull request targeting `main`. Lints `cloudformation/vpc.yaml` with `cfn-lint`. No AWS credentials involved at all.
-- **`deploy`** — runs on push to `main` (i.e. after a PR merges). Deploys the stack via GitHub OIDC.
+- [`.github/workflows/validate.yml`](.github/workflows/validate.yml) — runs on every pull request targeting `main`. Lints `cloudformation/vpc.yaml` with `cfn-lint`. No AWS credentials involved at all.
+- [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) — runs on push to `main` (i.e. after a PR merges). Deploys the stack via GitHub OIDC.
 
-Authentication for the `deploy` job uses **GitHub OIDC** — no long-lived AWS access keys stored anywhere in this repo. GitHub Actions requests a short-lived identity token and assumes `GitHubActionsDeployRole` directly; AWS trusts the request only because that role's trust policy checks the token's `sub` claim against this exact repo and branch.
+**Why two separate files instead of one workflow with two jobs** (which is how this started): each needed its own `concurrency` scope. `deploy` correctly queues behind other deploys (`group: cloudformation-deploy, cancel-in-progress: false` — never skip/cancel a real infrastructure change). But a single shared `concurrency` group across both jobs meant a PR's lint run would needlessly queue behind an in-progress production deploy too, despite `validate` never touching AWS at all. Separate files, separate groups: `validate` uses `group: cfn-lint-${{ github.event.pull_request.number }}, cancel-in-progress: true` instead — pushing several commits to the same PR quickly cancels the older, now-superseded lint run rather than queuing behind it.
+
+Authentication for `deploy` uses **GitHub OIDC** — no long-lived AWS access keys stored anywhere in this repo. GitHub Actions requests a short-lived identity token and assumes `GitHubActionsDeployRole` directly; AWS trusts the request only because that role's trust policy checks the token's `sub` claim against this exact repo and branch.
 
 **Why `validate` doesn't also use OIDC**: a `pull_request`-triggered OIDC token has a different `sub` claim shape than a `push`-triggered one (`repo:<org>/<repo>:pull_request` vs. `repo:<org>@<id>/<repo>@<id>:ref:refs/heads/main`), which `GitHubActionsDeployRole`'s trust policy deliberately doesn't authorize. Rather than widen that trust policy to also cover PR runs — which would mean any PR, in principle, could carry AWS credentials capable of deploying this stack — `validate` uses `cfn-lint` instead, which needs no cloud credentials at all. Safer default for a repo that takes PRs.
+
+### Branch protection on `main`
+
+Configured directly via the GitHub API (`gh api repos/<org>/<repo>/branches/main/protection`, not through the workflow files themselves):
+
+- **Pull request required before merge** — direct pushes to `main` are rejected by GitHub itself, not just by convention. `required_approving_review_count: 0`, since this is a solo-maintained repo and requiring even one approval would make the repo's own owner unable to ever merge their own PR.
+- **Required status check**: `Validate CloudFormation template (cfn-lint)` (the job name in `validate.yml`) must pass before a PR can be merged — a red `cfn-lint` result makes the merge button unavailable, not just a warning badge.
+- **`strict: true`** (branch must be up to date before merging) — forces a PR to be rebased onto the current `main` tip before merge is allowed. This is exactly the check that would have caught the PR #1/#2 merge conflict *before* merge was even permitted, rather than after (see "PR checks stop running / stuck pending" in Troubleshooting for what happened without it).
+- **`enforce_admins: true`** — applies even to the repository owner. Without this, the whole rule is optional for whoever needs it least to actually follow.
+- Force-pushes and deletion of `main` are also blocked, as a side effect of enabling any branch protection at all.
+
+**Gotcha to watch for if you ever rename the lint job or restructure the workflow files**: the required status check is matched by exact job name (`context` in the GitHub API), not by file path. If `validate.yml`'s job `name:` ever changes, update the branch protection rule's required check to match — otherwise every future PR becomes permanently unmergeable (including the one meant to fix it), since `enforce_admins: true` leaves no bypass.
+
+```bash
+# check current branch protection state:
+gh api repos/<org>/<repo>/branches/main/protection
+
+# update the required status check name if the job name ever changes:
+gh api repos/<org>/<repo>/branches/main/protection -X PUT --input - <<'EOF'
+{
+  "required_status_checks": {"strict": true, "checks": [{"context": "<new-job-name>"}]},
+  "enforce_admins": true,
+  "required_pull_request_reviews": {"required_approving_review_count": 0},
+  "restrictions": null
+}
+EOF
+```
 
 ### One-time AWS-side setup (already done for this stack)
 
@@ -878,7 +907,7 @@ Set these under **Settings → Secrets and variables → Actions → Repository 
 | Secret | Value |
 |---|---|
 | `AWS_DEPLOY_ROLE_ARN` | The `GitHubActionsDeployRoleArn` output from above, e.g. `arn:aws:iam::<account-id>:role/three-tier-app-github-actions-deploy-role` |
-| `DB_PASSWORD` | Value for the `DBPassword` parameter (8-41 chars, no `/`, `@`, `"`, or spaces) |
+| `DB_PASSWORD` | Value for the `DBPassword` parameter (8-41 chars, no `/`, `@`, `"`, `'`, `\`, or spaces) |
 | `KEY_PAIR_NAME` | Name of an existing EC2 key pair in `us-east-1` (`KeyPairName` parameter) |
 
 No AWS access key/secret key secrets exist at all with this approach — a role ARN isn't a credential by itself (nothing can be done with it without also passing GitHub's OIDC trust check), so it doesn't need the same secrecy as a real access key, though there's no harm in keeping it as a secret anyway.
@@ -891,7 +920,7 @@ Scoped deliberately, not a broad managed policy:
 - **S3**: restricted to bucket names starting with `three-tier-app-network-` (this stack's naming convention for the ALB logs bucket).
 - **IAM**: the tightest of all, since over-broad IAM permissions on a CI role is a privilege-escalation risk — restricted to role/instance-profile ARNs starting with `three-tier-app-` (this stack's own resources only, including the role itself, so future deploys can still update its own permissions).
 
-### What the `validate` job does (pull requests)
+### What `validate.yml` does (pull requests)
 
 1. Checks out the repo.
 2. Installs `cfn-lint` (Python, via `pip`).
@@ -899,7 +928,7 @@ Scoped deliberately, not a broad managed policy:
 
 No AWS credentials, no `deploy` step — this job's only purpose is to catch template-level mistakes before merge. `cfn-lint`'s exit code is non-zero for warnings too, not just errors, so it fails the check on `W`-level findings — see "cfn-lint W3005 / W1011 findings" in Troubleshooting for the two patterns already hit and how they were resolved.
 
-### What the `deploy` job does (push to `main`)
+### What `deploy.yml` does (push to `main`)
 
 1. Checks out the repo.
 2. Requests a GitHub OIDC token and assumes `AWS_DEPLOY_ROLE_ARN` (`aws-actions/configure-aws-credentials`, `role-to-assume` instead of static keys) — requires the job-level `permissions: id-token: write`.
@@ -911,7 +940,7 @@ No AWS credentials, no `deploy` step — this job's only purpose is to catch tem
 
 ### Limitations / things to know before relying on this for anything beyond a portfolio project
 
-- **The PR review gate lives in process, not in the workflow itself** — `deploy` still runs unconditionally on every push to `main`, with no approval step inside the workflow. What actually gates it is the branch/PR policy above (nothing reaches `main` without a merged PR) plus the `validate` job's lint check — not a `deploy`-side confirmation step. A merge is what triggers a real deploy; treat it that way.
+- **The PR gate is enforced by branch protection, not by the workflow itself** — `deploy.yml` still runs unconditionally on every push to `main`, with no approval step inside the workflow. What actually gates it is the branch protection rule above (PR + passing `cfn-lint` check required, enforced by GitHub itself, not by convention) — a merge is what triggers a real deploy, and merging is now the thing that's actually gated.
 - **No snapshot-restore or first-time-create handling** — this workflow assumes the stack already exists and is doing routine updates. The snapshot-restore parameters (`DBSnapshotIdentifier`, etc.) aren't wired into it; run that manually per the "Deploy restoring the database from a snapshot" section if ever needed.
 - **No instance refresh** — per "Update running instances after a launch template change" above, a stack update alone doesn't replace already-running EC2 instances. This workflow doesn't trigger one automatically; if a change needs it (AMI, `UserData`, IAM instance profile, etc.), run `aws autoscaling start-instance-refresh` manually afterward.
 - **The trust policy is branch-specific** — only pushes on `refs/heads/main` (via `GitHubBranch`, default `main`) can assume this role. A workflow run from a different branch, a fork, or a pull_request-triggered event (different `sub` claim shape) will get `AccessDenied` on the OIDC assume-role step, by design.
