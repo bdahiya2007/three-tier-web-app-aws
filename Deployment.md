@@ -1,6 +1,6 @@
 # Deployment
 
-Commands for deploying the full CloudFormation stack for the three-tier web app: a VPC spanning two Availability Zones, CloudFront (custom domain `admin.securecloudengineers.com`, DNS-validated ACM certificate, with a dedicated WAF Web ACL — SQLi and XSS managed rules) in front of an Application Load Balancer + Auto Scaling Group (2-3 instances by default, the ALB restricted to CloudFront's IP ranges only) launching WordPress EC2 instances (Amazon Linux 2023, PHP 8.3, Apache) across two public subnets, a MySQL RDS primary plus a read replica in the second AZ (WordPress routes writes to the primary and reads to the replica via the HyperDB drop-in), a single-node ElastiCache Redis cluster used as WordPress's object cache to reduce database load, an EFS file system mounted at `wp-content` on every instance so uploads/themes/plugins are shared across the group, a daily AWS Backup plan (30-day retention) covering RDS, EFS, and the EC2 web tier, a CloudWatch dashboard (EC2/RDS CPU, ALB request count), and logging (ALB access logs to S3, instance logs + RDS error log to CloudWatch Logs). Assumes AWS CLI v2 is installed and credentials are configured (`aws configure` or an active SSO/profile session) with permission to create VPC, RDS, EC2, ELBv2, EFS, ElastiCache, AWS Backup, IAM, S3, CloudWatch, CloudFront, WAF, ACM, Route 53, and Auto Scaling resources.
+Commands for deploying the full CloudFormation stack for the three-tier web app: a VPC spanning two Availability Zones, CloudFront (custom domain `blog.securecloudengineers.com`, DNS-validated ACM certificate, with a dedicated WAF Web ACL — SQLi and XSS managed rules) in front of an Application Load Balancer + Auto Scaling Group (2-3 instances by default, the ALB restricted to CloudFront's IP ranges only) launching WordPress EC2 instances (Amazon Linux 2023, PHP 8.3, Apache) across two public subnets, a MySQL RDS primary plus a read replica in the second AZ (WordPress routes writes to the primary and reads to the replica via the HyperDB drop-in), a single-node ElastiCache Redis cluster used as WordPress's object cache to reduce database load, an EFS file system mounted at `wp-content` on every instance so uploads/themes/plugins are shared across the group, a daily AWS Backup plan (30-day retention) covering RDS, EFS, and the EC2 web tier, a CloudWatch dashboard (EC2/RDS CPU, ALB request count), and logging (ALB access logs to S3, instance logs + RDS error log to CloudWatch Logs). Assumes AWS CLI v2 is installed and credentials are configured (`aws configure` or an active SSO/profile session) with permission to create VPC, RDS, EC2, ELBv2, EFS, ElastiCache, AWS Backup, IAM, S3, CloudWatch, CloudFront, WAF, ACM, Route 53, and Auto Scaling resources.
 
 **Every `deploy` command below needs `--capabilities CAPABILITY_NAMED_IAM`** — the stack creates a named IAM role (`CloudWatchAgentRole`, for the CloudWatch agent on each instance), and CloudFormation refuses to create/update IAM resources without this explicit acknowledgment. Omitting it fails with `Requires capabilities : [CAPABILITY_NAMED_IAM]`.
 
@@ -499,11 +499,11 @@ CloudFront sits in front of the ALB as the actual public entry point, with a ded
 
 **Cost added**: WAF has a flat ~$5/month Web ACL fee plus ~$1/month per rule group (2 here, ~$7/month total) plus a small per-million-requests charge; CloudFront itself is likely near-free at this project's traffic level (within or close to its own free tier for data transfer/requests). Brings the running total from the earlier ~$50-54/month estimate to roughly **$57-61/month**.
 
-### Custom domain (`admin.securecloudengineers.com`)
+### Custom domain (`blog.securecloudengineers.com`)
 
-`CustomDomainCertificate` is a DNS-validated ACM certificate for `CustomDomainName` (`admin.securecloudengineers.com` by default), created in `us-east-1` — a hard CloudFront requirement, regardless of which region the rest of the stack lives in. `DomainValidationOptions` with `HostedZoneId` lets CloudFormation create the validation CNAME itself and wait for issuance as part of the stack update; no manual console step, and no leftover validation record after a delete.
+`CustomDomainCertificate` is a DNS-validated ACM certificate for `CustomDomainName` (`blog.securecloudengineers.com` by default), created in `us-east-1` — a hard CloudFront requirement, regardless of which region the rest of the stack lives in. `DomainValidationOptions` with `HostedZoneId` lets CloudFormation create the validation CNAME itself and wait for issuance as part of the stack update; no manual console step, and no leftover validation record after a delete.
 
-`Route53HostedZoneId` (default `Z06930743HC9RLGHJO306`) points at the existing hosted zone for `securecloudengineers.com`, owned by a separate, independent stack (the `secure-static-website-aws` project, which already serves `www.securecloudengineers.com` from it). `CustomDomainDNSRecord`/`CustomDomainDNSRecordIPv6` add one new A/AAAA alias record into that zone for `admin.securecloudengineers.com` — a *new* record, not a modification of any of the zone's existing ones, so this doesn't have the cross-stack "whole list is authoritative" conflict that ruled out reusing that project's WAF Web ACL (see below): each `AWS::Route53::RecordSet` is its own independent resource, not a single list-valued property shared by every record in the zone.
+`Route53HostedZoneId` (default `Z06930743HC9RLGHJO306`) points at the existing hosted zone for `securecloudengineers.com`, owned by a separate, independent stack (the `secure-static-website-aws` project, which already serves `www.securecloudengineers.com` from it). `CustomDomainDNSRecord`/`CustomDomainDNSRecordIPv6` add one new A/AAAA alias record into that zone for `blog.securecloudengineers.com` — a *new* record, not a modification of any of the zone's existing ones, so this doesn't have the cross-stack "whole list is authoritative" conflict that ruled out reusing that project's WAF Web ACL (see below): each `AWS::Route53::RecordSet` is its own independent resource, not a single list-valued property shared by every record in the zone.
 
 The distribution's `Aliases` and `ViewerCertificate` were updated to use this certificate instead of the CloudFront default (`*.cloudfront.net`) certificate — `WordPressURL` now points at the custom domain, and the default CloudFront domain (`CloudFrontDomainName` output) still works too, side by side.
 
@@ -550,6 +550,8 @@ Same issue as every previous change to the public entry point (see "WordPress lo
 ```sql
 UPDATE wp_options SET option_value="<current-WordPressURL-output>" WHERE option_name IN ("siteurl","home");
 ```
+
+**Since the Redis object cache was added, also flush it after this SQL update** — see "Direct SQL writes to `wp_options` no longer take effect on their own" under "Redis object cache" above for why and the exact command.
 
 ### Verify the WAF is actually blocking attacks (not just attached)
 
@@ -805,6 +807,18 @@ The Redis Object Cache plugin is documented to catch connection failures and fal
 
 Same rule as the read replica above: a stack update alone doesn't touch already-running instances. Run an instance refresh to roll out the extension, plugin drop-in, and `wp-config.php` changes to instances that existed before this feature was added.
 
+### Direct SQL writes to `wp_options` no longer take effect on their own
+
+Discovered when renaming the custom domain: `siteurl`/`home` were updated correctly in the database, but `/wp-admin` kept redirecting to the *old* domain's `wp-login.php` anyway. The database was right; a direct `UPDATE wp_options` bypasses WordPress's own caching layer entirely, so the Redis-cached copy of the bulk-loaded autoloaded options (cache key `wp:options:alloptions`) kept serving the old value indefinitely — nothing about a raw SQL write tells Redis to invalidate it. This wasn't a problem before Redis existed (no cross-request cache to go stale), so every prior `wp_options` fix in this file predates the issue.
+
+**Fix**: flush the object cache immediately after any direct SQL write to `wp_options` (or any other table WordPress caches):
+
+```bash
+php -r "\$r = new Redis(); \$r->connect('<redis-endpoint>', 6379); \$r->flushDb();"
+```
+
+Safe to run any time — the object cache is entirely disposable and gets rebuilt from the database on the next read. Verified: after flushing, `/wp-admin` redirected to the correct, newly-updated domain immediately, with no other change needed.
+
 ## AWS Backup
 
 `BackupVault` is a dedicated vault; `BackupPlan` runs one rule (`Daily`) on a cron schedule (`BackupScheduleExpression`, default `cron(0 5 * * ? *)` — 05:00 UTC daily) with a 30-day retention (`BackupRetentionDays`) before AWS Backup deletes each recovery point. `BackupServiceRole` is the service role AWS Backup assumes to actually create backups, using the AWS-managed `AWSBackupServiceRolePolicyForBackup` policy.
@@ -1013,7 +1027,7 @@ See the dedicated "Gotcha: `LatestAmiId` doesn't auto-update just by editing the
   ```sql
   UPDATE wp_options SET option_value="<current-WordPressURL-output>" WHERE option_name IN ("siteurl","home");
   ```
-  After a fresh snapshot-restore deploy in particular, expect to need this — check it proactively rather than waiting for a broken login redirect to reveal it.
+  After a fresh snapshot-restore deploy in particular, expect to need this — check it proactively rather than waiting for a broken login redirect to reveal it. **Since the Redis object cache was added, also flush it after this SQL update** — see "Direct SQL writes to `wp_options` no longer take effect on their own" under "Redis object cache" above.
 
 ### Browser times out hitting an EC2 instance's public DNS/IP directly
 

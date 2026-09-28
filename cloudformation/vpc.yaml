@@ -178,7 +178,7 @@ Parameters:
 
   CustomDomainName:
     Type: String
-    Default: admin.securecloudengineers.com
+    Default: blog.securecloudengineers.com
     Description: >-
       Custom domain for CloudFront, alongside its default *.cloudfront.net domain.
       Must be a subdomain of Route53HostedZoneId's zone; its ACM cert is DNS-validated
