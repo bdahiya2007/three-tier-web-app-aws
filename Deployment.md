@@ -1175,11 +1175,15 @@ No AWS credentials, no `deploy` step — this job's only purpose is to catch tem
 
 `--no-fail-on-empty-changeset` is important here: most pushes to `main` won't touch `cloudformation/vpc.yaml` at all (e.g. a `Deployment.md` edit), and without that flag `aws cloudformation deploy` exits non-zero when there's nothing to actually change — which would mark the workflow as failed for completely unrelated commits.
 
+### Manual approval gate before every deploy
+
+The `deploy` job in `deploy.yml` targets a GitHub Environment named `production`, configured (via the GitHub API, not in this repo's files — environment protection rules aren't expressible in workflow YAML) with `bdahiya2007` as a required reviewer. A push to `main` still triggers the workflow run immediately, but the `deploy` job **pauses before running any steps** until explicitly approved from the Actions tab (the run's page → "Review deployments" → Approve) — a separate checkpoint from the PR merge itself, not a replacement for it. `prevent_self_review` is left at its default (`false`), since a solo maintainer needs to be able to approve their own deployments.
+
+**Why add this on top of branch protection**: branch protection gates what can reach `main` (PR + passing `cfn-lint`), but nothing previously gated the moment `main` actually gets pushed to AWS — merging *was* deploying. This adds a genuine pause between "the change is merged" and "the change is live," useful as a last "did I actually mean to ship this right now" check, independent of whether the PR review itself was thorough.
+
 ### Limitations / things to know before relying on this for anything beyond a portfolio project
 
-- **The PR gate is enforced by branch protection, not by the workflow itself** — `deploy.yml` still runs unconditionally on every push to `main`, with no approval step inside the workflow. What actually gates it is the branch protection rule above (PR + passing `cfn-lint` check required, enforced by GitHub itself, not by convention) — a merge is what triggers a real deploy, and merging is now the thing that's actually gated.
 - **No snapshot-restore or first-time-create handling** — this workflow assumes the stack already exists and is doing routine updates. The snapshot-restore parameters (`DBSnapshotIdentifier`, etc.) aren't wired into it; run that manually per the "Deploy restoring the database from a snapshot" section if ever needed.
-- **No instance refresh** — per "Update running instances after a launch template change" above, a stack update alone doesn't replace already-running EC2 instances. This workflow doesn't trigger one automatically; if a change needs it (AMI, `UserData`, IAM instance profile, etc.), run `aws autoscaling start-instance-refresh` manually afterward.
 - **The trust policy is branch-specific** — only pushes on `refs/heads/main` (via `GitHubBranch`, default `main`) can assume this role. A workflow run from a different branch, a fork, or a pull_request-triggered event (different `sub` claim shape) will get `AccessDenied` on the OIDC assume-role step, by design.
 
 ## Delete the stack

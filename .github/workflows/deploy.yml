@@ -33,6 +33,12 @@ jobs:
   deploy:
     name: Deploy to AWS
     runs-on: ubuntu-latest
+    # Requires manual approval (production environment, configured with
+    # bdahiya2007 as required reviewer via the GitHub API - not in this file,
+    # since environment protection rules aren't expressible in workflow YAML).
+    # A push to main triggers the run, but it pauses here until approved from
+    # the Actions tab, even after the merge itself already happened.
+    environment: production
     permissions:
       id-token: write # required to request the OIDC token
       contents: read
