@@ -44,17 +44,17 @@ Parameters:
   PrivateSubnet2Cidr:
     Type: String
     Default: 10.0.3.0/24
-    Description: CIDR for the second private subnet (DB subnet group only).
+    Description: CIDR for the second private subnet (DB subnet group).
 
   PublicSubnet2Cidr:
     Type: String
     Default: 10.0.4.0/24
-    Description: CIDR for the second public subnet (ALB, Auto Scaling Group).
+    Description: CIDR for the second public subnet (ALB, ASG).
 
   DBName:
     Type: String
     Default: appdb
-    Description: Initial database name created on the RDS instance.
+    Description: Initial RDS database name.
 
   DBUsername:
     Type: String
@@ -65,7 +65,7 @@ Parameters:
   DBPassword:
     Type: String
     # ' and \ excluded: db-config.php embeds this in a single-quoted PHP string
-    Description: RDS master password (8-41 chars, no / @ " ' \ or spaces).
+    Description: RDS master password (8-41 chars, no / @ " ' \ or spaces)
     NoEcho: true
     MinLength: 8
     MaxLength: 41
@@ -79,7 +79,7 @@ Parameters:
   DBAllocatedStorage:
     Type: Number
     Default: 20
-    Description: Allocated storage for the RDS instance, in GiB.
+    Description: RDS storage, in GiB.
 
   DBEngineVersion:
     Type: String
@@ -106,12 +106,12 @@ Parameters:
   BackupScheduleExpression:
     Type: String
     Default: cron(0 5 * * ? *)
-    Description: AWS Backup cron schedule (UTC); default is daily at 05:00.
+    Description: AWS Backup cron schedule (UTC), default daily at 05:00.
 
   DBBackupRetentionPeriod:
     Type: Number
     Default: 1
-    Description: RDS backup retention (days); free tier caps at 1.
+    Description: RDS backup retention (days); free tier caps at 1
 
   DBSnapshotIdentifier:
     Type: String
@@ -125,13 +125,13 @@ Parameters:
   WebServerInstanceType:
     Type: String
     Default: t3.micro
-    Description: EC2 instance type for the WordPress web server.
+    Description: EC2 instance type for the web tier.
 
   SSHLocationCidr:
     Type: String
     Default: 0.0.0.0/0
     AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
-    Description: CIDR allowed to SSH - restrict to your own IP.
+    Description: CIDR allowed to SSH - use your own IP.
 
   LatestAmiId:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
@@ -156,7 +156,7 @@ Parameters:
   LogRetentionDays:
     Type: Number
     Default: 7
-    Description: Retention period (days) for CloudWatch Logs log groups.
+    Description: CloudWatch Logs retention (days)
 
   CloudFrontOriginFacingPrefixListId:
     Type: String
@@ -174,7 +174,7 @@ Parameters:
       - PriceClass_100
       - PriceClass_200
       - PriceClass_All
-    Description: CloudFront price class - PriceClass_100 is cheapest/default.
+    Description: CloudFront price class (PriceClass_100 cheapest/default).
 
   CustomDomainName:
     Type: String
@@ -208,7 +208,7 @@ Parameters:
 
   GitHubRepo:
     Type: String
-    Description: GitHub repository name (no owner) for OIDC trust.
+    Description: GitHub repository name (no owner).
 
   GitHubRepoId:
     Type: String
@@ -219,7 +219,7 @@ Parameters:
   GitHubBranch:
     Type: String
     Default: main
-    Description: Branch allowed to assume the CI deploy role via OIDC.
+    Description: Branch allowed to assume the CI deploy role.
 
 Conditions:
   RestoreFromSnapshot: !Not [!Equals [!Ref DBSnapshotIdentifier, '']]
@@ -1147,7 +1147,10 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}@${GitHubOrgId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/heads/${GitHubBranch}
+                # sub changes to "...:environment:production" with a job environment.
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}@${GitHubOrgId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/heads/${GitHubBranch}
+                  - !Sub repo:${GitHubOrg}@${GitHubOrgId}/${GitHubRepo}@${GitHubRepoId}:environment:production
       Policies:
         - PolicyName: DeployThreeTierStack
           PolicyDocument:
@@ -1381,13 +1384,13 @@ Outputs:
       Name: !Sub ${EnvironmentName}-private-rt-id
 
   PublicSubnet2Id:
-    Description: Second public subnet ID (ALB and Auto Scaling Group)
+    Description: Second public subnet ID (ALB, ASG)
     Value: !Ref PublicSubnet2
     Export:
       Name: !Sub ${EnvironmentName}-public-subnet-2-id
 
   PrivateSubnet2Id:
-    Description: Second private subnet ID (DB subnet group only)
+    Description: Second private subnet ID (DB subnet group)
     Value: !Ref PrivateSubnet2
     Export:
       Name: !Sub ${EnvironmentName}-private-subnet-2-id
@@ -1427,13 +1430,13 @@ Outputs:
     Value: !GetAtt DBReadReplica.Endpoint.Port
 
   WebServerSecurityGroupId:
-    Description: Security group ID for the WordPress web servers
+    Description: Web server security group ID
     Value: !Ref WebServerSecurityGroup
     Export:
       Name: !Sub ${EnvironmentName}-web-sg-id
 
   ALBSecurityGroupId:
-    Description: Security group ID for the Application Load Balancer
+    Description: ALB security group ID
     Value: !Ref ALBSecurityGroup
     Export:
       Name: !Sub ${EnvironmentName}-alb-sg-id
@@ -1447,7 +1450,7 @@ Outputs:
     Value: !Ref WebServerAutoScalingGroup
 
   CloudFrontDomainName:
-    Description: CloudFront's default *.cloudfront.net domain
+    Description: CloudFront's default cloudfront.net domain
     Value: !GetAtt CloudFrontDistribution.DomainName
 
   CloudFrontDistributionId:
@@ -1455,7 +1458,7 @@ Outputs:
     Value: !Ref CloudFrontDistribution
 
   WAFWebACLArn:
-    Description: WAF Web ACL ARN attached to the CloudFront distribution
+    Description: WAF Web ACL ARN
     Value: !GetAtt WAFWebACL.Arn
 
   CustomDomainCertificateArn:
@@ -1463,11 +1466,11 @@ Outputs:
     Value: !Ref CustomDomainCertificate
 
   WordPressURL:
-    Description: WordPress site URL (custom domain, via CloudFront + WAF)
+    Description: WordPress site URL (via CloudFront + WAF)
     Value: !Sub https://${CustomDomainName}
 
   EFSFileSystemId:
-    Description: EFS file system ID (mounted at wp-content on every instance)
+    Description: EFS file system ID (mounted at wp-content)
     Value: !Ref EFSFileSystem
     Export:
       Name: !Sub ${EnvironmentName}-efs-id
@@ -1479,19 +1482,19 @@ Outputs:
       Name: !Sub ${EnvironmentName}-efs-sg-id
 
   RedisEndpoint:
-    Description: Redis endpoint address used by WordPress as its object cache
+    Description: Redis endpoint used as WordPress's object cache
     Value: !GetAtt RedisCluster.RedisEndpoint.Address
 
   BackupVaultName:
-    Description: AWS Backup vault holding daily RDS/EFS/EC2 recovery points
+    Description: AWS Backup vault name
     Value: !Ref BackupVault
 
   BackupPlanId:
-    Description: AWS Backup plan ID (daily backups, 30-day retention by default)
+    Description: AWS Backup plan ID
     Value: !GetAtt BackupPlan.BackupPlanId
 
   CloudWatchDashboardURL:
-    Description: CloudWatch dashboard URL (EC2/RDS CPU, ALB request count)
+    Description: CloudWatch dashboard URL
     Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${CloudWatchDashboard}
 
   ALBLogsBucketName:
@@ -1501,13 +1504,13 @@ Outputs:
       Name: !Sub ${EnvironmentName}-alb-logs-bucket
 
   HttpdErrorLogGroupName:
-    Description: CloudWatch Logs group receiving each instance's Apache error_log
+    Description: CloudWatch Logs group for Apache error_log
     Value: !Ref HttpdErrorLogGroup
 
   CloudInitLogGroupName:
-    Description: CloudWatch Logs group for each instance's cloud-init-output.log
+    Description: CloudWatch Logs group for cloud-init-output.log
     Value: !Ref CloudInitLogGroup
 
   GitHubActionsDeployRoleArn:
-    Description: IAM role ARN GitHub Actions assumes via OIDC to deploy this stack
+    Description: IAM role ARN GitHub Actions assumes via OIDC
     Value: !GetAtt GitHubActionsDeployRole.Arn

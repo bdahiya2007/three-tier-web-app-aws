@@ -908,6 +908,19 @@ Every issue actually hit while building and operating this stack, with symptom �
   ```
   Then redeploy with `GitHubOrgId`/`GitHubRepoId` set, so the condition becomes `repo:${GitHubOrg}@${GitHubOrgId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/heads/${GitHubBranch}`.
 
+### GitHub Actions OIDC breaks again after adding an `environment:` to a job
+
+- **Symptom**: The exact same `AssumeRoleWithWebIdentity`/`AccessDenied` failure as above, but on a workflow that was working fine — the only recent change was adding a manual approval gate (`environment: production` on the `deploy` job).
+- **Cause**: GitHub's OIDC token `sub` claim format is different for a job that targets an Environment: `repo:<org>@<id>/<repo>@<id>:environment:<name>`, not the `:ref:refs/heads/<branch>` format used otherwise. Adding `environment:` to a job **changes what `sub` value it presents** — the trust policy condition that matched before stops matching, silently, with the same generic "not authorized" error as the numeric-ID issue above.
+- **How this was actually diagnosed**: same CloudTrail lookup as the entry above — `userIdentity.principalId` on the denied call showed `...:environment:production` where the trust policy still expected `...:ref:refs/heads/main`.
+- **Fix**: list both `sub` formats in the trust policy's `StringEquals` condition (IAM matches a `StringEquals` condition against *any* value in a list, not just the first):
+  ```yaml
+  token.actions.githubusercontent.com:sub:
+    - !Sub repo:${GitHubOrg}@${GitHubOrgId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/heads/${GitHubBranch}
+    - !Sub repo:${GitHubOrg}@${GitHubOrgId}/${GitHubRepo}@${GitHubRepoId}:environment:production
+  ```
+- **General lesson**: any change to *how* a job runs (adding an environment, a matrix, a reusable-workflow call, etc.) can silently change the OIDC `sub` claim GitHub presents. Treat a trust policy condition as tied to the exact job configuration it was written against, and re-verify it (via CloudTrail, not assumption) after changing that configuration — not just after changing the org/repo/branch values it references.
+
 ### GitHub Actions deploy fails: "AccessDenied ... cloudformation:GetTemplateSummary"
 
 - **Symptom**: OIDC assume-role succeeds (progress — see the previous entry), but the very next step, `aws cloudformation deploy`, fails almost immediately with `User: .../GitHubActionsDeployRole/GitHubActions is not authorized to perform: cloudformation:GetTemplateSummary`.
@@ -1180,6 +1193,8 @@ No AWS credentials, no `deploy` step — this job's only purpose is to catch tem
 The `deploy` job in `deploy.yml` targets a GitHub Environment named `production`, configured (via the GitHub API, not in this repo's files — environment protection rules aren't expressible in workflow YAML) with `bdahiya2007` as a required reviewer. A push to `main` still triggers the workflow run immediately, but the `deploy` job **pauses before running any steps** until explicitly approved from the Actions tab (the run's page → "Review deployments" → Approve) — a separate checkpoint from the PR merge itself, not a replacement for it. `prevent_self_review` is left at its default (`false`), since a solo maintainer needs to be able to approve their own deployments.
 
 **Why add this on top of branch protection**: branch protection gates what can reach `main` (PR + passing `cfn-lint`), but nothing previously gated the moment `main` actually gets pushed to AWS — merging *was* deploying. This adds a genuine pause between "the change is merged" and "the change is live," useful as a last "did I actually mean to ship this right now" check, independent of whether the PR review itself was thorough.
+
+**Real regression this caused**: adding `environment: production` changed the OIDC `sub` claim the job presents (`...:environment:production` instead of `...:ref:refs/heads/main`), which broke role assumption entirely the next time `main` was pushed to — see "GitHub Actions OIDC breaks again after adding an `environment:` to a job" in Troubleshooting for the fix. Caught via CloudTrail, not assumed; fixed by listing both `sub` formats in the trust policy.
 
 ### Limitations / things to know before relying on this for anything beyond a portfolio project
 
