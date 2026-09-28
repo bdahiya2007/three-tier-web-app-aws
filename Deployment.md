@@ -156,7 +156,13 @@ aws cloudformation wait stack-update-complete \
 
 ## Update running instances after a launch template change
 
-Any change that affects the launch template — `DBPassword`, `LatestAmiId`, `WebServerInstanceType`, or editing the `UserData` script itself (e.g. the PHP version installed) — creates a **new launch template version** when you deploy, but does **not** touch instances that are already running. You must explicitly tell the Auto Scaling Group to replace them:
+Any change that affects the launch template — `DBPassword`, `LatestAmiId`, `WebServerInstanceType`, or editing the `UserData` script itself (e.g. the PHP version installed) — creates a **new launch template version** when you deploy.
+
+**`WebServerAutoScalingGroup` now has an `UpdatePolicy` (`AutoScalingRollingUpdate`, `MinInstancesInService: AsgMinSize`, `MaxBatchSize: 1`), so this rollout now happens automatically as part of the stack update itself** — the `aws cloudformation deploy`/`update-stack` call doesn't return `UPDATE_COMPLETE` until every instance has actually been replaced and passed its health check. No separate manual step needed for the common case anymore.
+
+**Tradeoff worth knowing**: this removes the manual pause that used to exist between "the stack update finished" and "running instances actually got the new config" — previously, a bad AMI/UserData change would sit harmlessly on the launch template until someone manually ran an instance refresh, giving a chance to catch it first. Now a bad change rolls out automatically on merge. The safety net that replaces the manual pause is CloudFormation's own rollback behavior: instances that fail their health check during the rolling update cause the *whole stack update* to fail and roll back (same as any other resource failure) — so a broken change won't succeed in replacing every instance silently, but it does mean the failure surfaces during the deploy itself rather than being caught before instances are ever touched.
+
+**Manual instance refresh is still available** for the case where you want to force new instances *without* any actual launch-template property change (e.g. to pick up new OS-level packages that landed inside the same AMI ID, or as a routine restart) — `UpdatePolicy` only triggers on a real diff to the launch template, so a genuinely no-op deploy won't roll anything automatically:
 
 ```bash
 aws autoscaling start-instance-refresh \
