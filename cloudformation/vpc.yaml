@@ -1,14 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Three-tier web app. VPC (us-east-1, two AZs) with CloudFront (custom domain, WAF:
-  SQLi + common/XSS rules) in front of an ALB + Auto Scaling Group (2-3 instances)
-  running WordPress across two public subnets - the ALB only accepts traffic from
-  CloudFront's IP ranges. A MySQL RDS primary plus a read replica in the second AZ
-  (writes to the primary, reads to the replica via HyperDB) and a Redis object cache
-  (ElastiCache) reduce DB load, EFS-shared wp-content, a CloudWatch dashboard, logging
-  (ALB access logs to S3, instance/RDS logs to CloudWatch Logs), and a GitHub Actions
-  deploy role via OIDC. The primary RDS instance is single-AZ; the second private
-  subnet satisfies RDS's multi-AZ subnet-group requirement and hosts the replica.
+  Three-tier web app. VPC (us-east-1, two AZs) with CloudFront+WAF (SQLi + XSS
+  rules) in front of an HTTPS ALB + Auto Scaling Group (2-3 instances) running
+  WordPress across two public subnets - the ALB only accepts traffic from
+  CloudFront's IPs. A MySQL RDS primary plus a read replica in the second AZ
+  (writes to the primary, reads to the replica via HyperDB) and a Redis object
+  cache reduce DB load, EFS-shared wp-content, a CloudWatch dashboard, logging
+  (ALB access logs to S3, instance/RDS logs to CloudWatch Logs), and a GitHub
+  Actions deploy role via OIDC. The primary RDS instance is single-AZ; the
+  second private subnet satisfies RDS's subnet-group requirement and hosts the replica.
 
 Parameters:
   EnvironmentName:
@@ -19,12 +19,12 @@ Parameters:
   AvailabilityZone:
     Type: AWS::EC2::AvailabilityZone::Name
     Default: us-east-1a
-    Description: AZ for the public/private subnets and RDS.
+    Description: AZ for public/private subnets and RDS.
 
   SecondAvailabilityZone:
     Type: AWS::EC2::AvailabilityZone::Name
     Default: us-east-1b
-    Description: Second AZ for RDS's multi-AZ subnet group.
+    Description: Second AZ for RDS's subnet group.
 
   VpcCidr:
     Type: String
@@ -395,15 +395,19 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-alb-sg
 
-  ALBSecurityGroupIngressFromCloudFront:
+  # No port-80 rule: the prefix list has 46 entries, and each rule referencing it
+  # consumes 46 rule slots against the 60-per-SG quota - a second (80+443) rule
+  # would exceed it. Moot anyway: CloudFront's origin is https-only, so it never
+  # sends port-80 traffic to the ALB regardless of what the SG allows.
+  ALBSecurityGroupIngressHttpsFromCloudFront:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
       GroupId: !Ref ALBSecurityGroup
       IpProtocol: tcp
-      FromPort: 80
-      ToPort: 80
+      FromPort: 443
+      ToPort: 443
       SourcePrefixListId: !Ref CloudFrontOriginFacingPrefixListId
-      Description: HTTP access from CloudFront origin-facing IP ranges only
+      Description: HTTPS access from CloudFront origin-facing IP ranges only
 
   ALBLogsBucket:
     Type: AWS::S3::Bucket
@@ -495,12 +499,19 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-tg
 
-  ALBListener:
+  # Only listener - no port 80 at all, since the security group only allows 443
+  # (see above) and CloudFront's origin is https-only; nothing can ever reach 80.
+  ALBHttpsListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
       LoadBalancerArn: !Ref ApplicationLoadBalancer
-      Port: 80
-      Protocol: HTTP
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CustomDomainCertificate
+      # Latest as of writing (verified via describe-ssl-policies): same TLS1.2/1.3
+      # ciphers as -2021-06, plus PQ-hybrid key exchange.
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-PQ-2025-09
       DefaultActions:
         - Type: forward
           TargetGroupArn: !Ref ALBTargetGroup
@@ -542,8 +553,7 @@ Resources:
             ManagedRuleGroupStatement:
               VendorName: AWS
               Name: AWSManagedRulesCommonRuleSet
-              # Both blocked real content too; Counted not disabled - XSS re-blocked
-              # below except REST API paths (BlockXSSBodyExceptRestApi).
+              # Both blocked real content too; Counted, not disabled (see below).
               RuleActionOverrides:
                 - Name: SizeRestrictions_BODY
                   ActionToUse:
@@ -610,7 +620,7 @@ Resources:
           - Id: ALBOrigin
             DomainName: !GetAtt ApplicationLoadBalancer.DNSName
             CustomOriginConfig:
-              OriginProtocolPolicy: http-only
+              OriginProtocolPolicy: https-only
               HTTPPort: 80
               HTTPSPort: 443
               OriginSSLProtocols:
@@ -631,8 +641,7 @@ Resources:
             - HEAD
           # Managed policy "CachingDisabled"
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
-          # "AllViewerAndCloudFrontHeaders-2022-06" - forwards CloudFront-* headers too
-          # (avoids a /wp-admin redirect loop, see UserData).
+          # "AllViewerAndCloudFrontHeaders-2022-06" - avoids a /wp-admin redirect loop.
           OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc
         ViewerCertificate:
           AcmCertificateArn: !Ref CustomDomainCertificate
@@ -649,8 +658,7 @@ Resources:
       Name: !Ref CustomDomainName
       Type: A
       AliasTarget:
-        # Fixed, AWS-wide hosted zone ID for any CloudFront distribution as an alias
-        # target - not specific to this account or distribution.
+        # Fixed AWS-wide hosted zone ID for any CloudFront distribution.
         HostedZoneId: Z2FDTNDATAQYW2
         DNSName: !GetAtt CloudFrontDistribution.DomainName
         EvaluateTargetHealth: false
@@ -852,7 +860,7 @@ Resources:
               sed -i "s/password_here/${DBPassword}/" wp-config.php
               sed -i "s/localhost/${DBInstance.Endpoint.Address}/" wp-config.php
 
-              # ALB is HTTP-only, so X-Forwarded-Proto reads "http" - use CloudFront-Forwarded-Proto.
+              # Redundant now the ALB origin is HTTPS, kept as a defensive fallback.
               cat > /tmp/https-proxy-fix.php <<'PHPSNIPPET'
               if ( isset( $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] ) && $_SERVER['HTTP_CLOUDFRONT_FORWARDED_PROTO'] === 'https' ) {
               	$_SERVER['HTTPS'] = 'on';
@@ -923,8 +931,7 @@ Resources:
 
   WebServerAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
-    # MinInstancesInService=AsgMinSize, MaxBatchSize=1: replaces one at a time,
-    # briefly scaling to AsgMaxSize instead of dipping below AsgMinSize.
+    # MinInstancesInService=AsgMinSize: replaces instances without dipping below it.
     UpdatePolicy:
       AutoScalingRollingUpdate:
         MinInstancesInService: !Ref AsgMinSize
@@ -954,8 +961,7 @@ Resources:
     Type: AWS::RDS::DBInstance
     DeletionPolicy: Snapshot
     UpdateReplacePolicy: Snapshot
-    # cfn-lint W1011 suppressed: at this scale, Secrets Manager's ~$0.40/mo audit/
-    # rotation isn't needed yet - a tradeoff, not an oversight.
+    # cfn-lint W1011 suppressed: Secrets Manager isn't needed at this scale.
     Metadata:
       cfn-lint:
         config:
@@ -987,8 +993,7 @@ Resources:
 
   DBReadReplica:
     Type: AWS::RDS::DBInstance
-    # No explicit DependsOn: DBInstance - already enforced implicitly by
-    # !Ref DBInstance in SourceDBInstanceIdentifier below (cfn-lint W3005).
+    # No explicit DependsOn: enforced implicitly via SourceDBInstanceIdentifier.
     Properties:
       SourceDBInstanceIdentifier: !Ref DBInstance
       DBInstanceClass: !Ref DBInstanceClass
@@ -1078,8 +1083,7 @@ Resources:
 
   DBErrorLogRetention:
     Type: Custom::SetRdsLogRetention
-    # No explicit DependsOn: DBInstance - already enforced implicitly by the
-    # !Ref DBInstance in LogGroupName below (cfn-lint W3005).
+    # No explicit DependsOn: enforced implicitly via LogGroupName (cfn-lint W3005).
     Properties:
       ServiceToken: !GetAtt RdsLogRetentionFunction.Arn
       LogGroupName: !Sub /aws/rds/instance/${DBInstance}/error
