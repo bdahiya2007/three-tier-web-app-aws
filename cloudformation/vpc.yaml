@@ -19,12 +19,12 @@ Parameters:
   AvailabilityZone:
     Type: AWS::EC2::AvailabilityZone::Name
     Default: us-east-1a
-    Description: AZ for the public subnet, private subnet, and RDS instance.
+    Description: AZ for the public/private subnets and RDS.
 
   SecondAvailabilityZone:
     Type: AWS::EC2::AvailabilityZone::Name
     Default: us-east-1b
-    Description: Second AZ for the RDS DB subnet group's multi-AZ requirement.
+    Description: Second AZ for RDS's multi-AZ subnet group.
 
   VpcCidr:
     Type: String
@@ -116,7 +116,7 @@ Parameters:
   DBSnapshotIdentifier:
     Type: String
     Default: ''
-    Description: Optional RDS snapshot to restore from (DBUsername must match its master username).
+    Description: Optional RDS snapshot to restore from.
 
   KeyPairName:
     Type: AWS::EC2::KeyPair::KeyName
@@ -136,22 +136,22 @@ Parameters:
   LatestAmiId:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
     Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
-    Description: SSM parameter resolving to the latest Amazon Linux 2023 AMI ID.
+    Description: SSM parameter for the latest AL2023 AMI ID.
 
   AsgMinSize:
     Type: Number
     Default: 2
-    Description: Minimum number of WordPress instances in the Auto Scaling Group.
+    Description: Minimum WordPress instances in the ASG.
 
   AsgMaxSize:
     Type: Number
     Default: 3
-    Description: Maximum number of WordPress instances in the Auto Scaling Group.
+    Description: Maximum WordPress instances in the ASG.
 
   AsgDesiredCapacity:
     Type: Number
     Default: 2
-    Description: Desired number of WordPress instances in the Auto Scaling Group.
+    Description: Desired WordPress instances in the ASG.
 
   LogRetentionDays:
     Type: Number
@@ -174,7 +174,7 @@ Parameters:
       - PriceClass_100
       - PriceClass_200
       - PriceClass_All
-    Description: CloudFront price class - PriceClass_100 is cheapest/default; PriceClass_All costs more.
+    Description: CloudFront price class - PriceClass_100 is cheapest/default.
 
   CustomDomainName:
     Type: String
@@ -542,8 +542,8 @@ Resources:
             ManagedRuleGroupStatement:
               VendorName: AWS
               Name: AWSManagedRulesCommonRuleSet
-              # Both blocked real WordPress content too; Counted not disabled - XSS
-              # re-blocked below except on REST API paths (BlockXSSBodyExceptRestApi).
+              # Both blocked real content too; Counted not disabled - XSS re-blocked
+              # below except REST API paths (BlockXSSBodyExceptRestApi).
               RuleActionOverrides:
                 - Name: SizeRestrictions_BODY
                   ActionToUse:
@@ -923,6 +923,13 @@ Resources:
 
   WebServerAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
+    # MinInstancesInService=AsgMinSize, MaxBatchSize=1: replaces one at a time,
+    # briefly scaling to AsgMaxSize instead of dipping below AsgMinSize.
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !Ref AsgMinSize
+        MaxBatchSize: 1
+        PauseTime: PT10M
     Properties:
       AutoScalingGroupName: !Sub ${EnvironmentName}-asg
       VPCZoneIdentifier:
@@ -1432,7 +1439,7 @@ Outputs:
       Name: !Sub ${EnvironmentName}-alb-sg-id
 
   LoadBalancerDNSName:
-    Description: ALB's DNS name (not internet-reachable, for troubleshooting)
+    Description: ALB's DNS name (not internet-reachable)
     Value: !GetAtt ApplicationLoadBalancer.DNSName
 
   AutoScalingGroupName:
@@ -1448,11 +1455,11 @@ Outputs:
     Value: !Ref CloudFrontDistribution
 
   WAFWebACLArn:
-    Description: ARN of the WAF Web ACL attached to the CloudFront distribution
+    Description: WAF Web ACL ARN attached to the CloudFront distribution
     Value: !GetAtt WAFWebACL.Arn
 
   CustomDomainCertificateArn:
-    Description: ARN of the ACM certificate issued for CustomDomainName
+    Description: ACM certificate ARN for CustomDomainName
     Value: !Ref CustomDomainCertificate
 
   WordPressURL:
@@ -1498,7 +1505,7 @@ Outputs:
     Value: !Ref HttpdErrorLogGroup
 
   CloudInitLogGroupName:
-    Description: CloudWatch Logs group receiving each instance's cloud-init-output.log (the UserData bootstrap script's output)
+    Description: CloudWatch Logs group for each instance's cloud-init-output.log
     Value: !Ref CloudInitLogGroup
 
   GitHubActionsDeployRoleArn:
