@@ -44,7 +44,7 @@ Parameters:
   PrivateSubnet2Cidr:
     Type: String
     Default: 10.0.3.0/24
-    Description: CIDR for the second private subnet (DB subnet group).
+    Description: Second private subnet CIDR.
 
   PublicSubnet2Cidr:
     Type: String
@@ -65,7 +65,7 @@ Parameters:
   DBPassword:
     Type: String
     # ' and \ excluded: db-config.php embeds this in a single-quoted PHP string
-    Description: RDS master password (8-41 chars, no / @ " ' \ or spaces)
+    Description: RDS master password (8-41 chars, no / @ " ' \ spaces)
     NoEcho: true
     MinLength: 8
     MaxLength: 41
@@ -83,7 +83,7 @@ Parameters:
 
   DBEngineVersion:
     Type: String
-    Default: '8.0'
+    Default: '8.4'
     Description: MySQL engine version.
 
   RedisNodeType:
@@ -106,7 +106,7 @@ Parameters:
   BackupScheduleExpression:
     Type: String
     Default: cron(0 5 * * ? *)
-    Description: AWS Backup cron schedule (UTC), default daily at 05:00.
+    Description: AWS Backup cron schedule (UTC).
 
   DBBackupRetentionPeriod:
     Type: Number
@@ -120,18 +120,18 @@ Parameters:
 
   KeyPairName:
     Type: AWS::EC2::KeyPair::KeyName
-    Description: Existing EC2 key pair for SSH access.
+    Description: Existing EC2 key pair name.
 
   WebServerInstanceType:
     Type: String
     Default: t3.micro
-    Description: EC2 instance type for the web tier.
+    Description: EC2 instance type.
 
   SSHLocationCidr:
     Type: String
     Default: 0.0.0.0/0
     AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
-    Description: CIDR allowed to SSH - use your own IP.
+    Description: CIDR allowed to SSH.
 
   LatestAmiId:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
@@ -174,7 +174,7 @@ Parameters:
       - PriceClass_100
       - PriceClass_200
       - PriceClass_All
-    Description: CloudFront price class (PriceClass_100 cheapest/default).
+    Description: CloudFront price class (PriceClass_100 default).
 
   CustomDomainName:
     Type: String
@@ -971,6 +971,7 @@ Resources:
       DBName: !If [RestoreFromSnapshot, !Ref 'AWS::NoValue', !Ref DBName]
       Engine: mysql
       EngineVersion: !Ref DBEngineVersion
+      AllowMajorVersionUpgrade: true # required to cross the 8.0->8.4 boundary
       DBInstanceClass: !Ref DBInstanceClass
       AllocatedStorage: !Ref DBAllocatedStorage
       MasterUsername: !Ref DBUsername
@@ -996,6 +997,8 @@ Resources:
     # No explicit DependsOn: enforced implicitly via SourceDBInstanceIdentifier.
     Properties:
       SourceDBInstanceIdentifier: !Ref DBInstance
+      EngineVersion: !Ref DBEngineVersion
+      AllowMajorVersionUpgrade: true
       DBInstanceClass: !Ref DBInstanceClass
       AvailabilityZone: !Ref SecondAvailabilityZone
       PubliclyAccessible: false
@@ -1462,7 +1465,7 @@ Outputs:
     Value: !Ref CloudFrontDistribution
 
   WAFWebACLArn:
-    Description: WAF Web ACL ARN
+    Description: WAF ACL ARN
     Value: !GetAtt WAFWebACL.Arn
 
   CustomDomainCertificateArn:
