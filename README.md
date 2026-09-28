@@ -2,14 +2,14 @@
 
 [![Deploy CloudFormation Stack](https://github.com/bdahiya2007/three-tier-web-app-aws/actions/workflows/deploy.yml/badge.svg)](https://github.com/bdahiya2007/three-tier-web-app-aws/actions/workflows/deploy.yml)
 
-A production-style three-tier web architecture on AWS — WordPress running behind CloudFront (on a custom domain, `admin.securecloudengineers.com`, with a DNS-validated ACM certificate) and a dedicated WAF Web ACL, on a horizontally-scaled, self-healing web tier that isn't even reachable except through that edge layer, backed by a database that's never directly reachable, splits reads across a cross-AZ read replica, and is shielded from repeat reads by a Redis object cache, with shared state, a daily AWS Backup plan (30-day retention) covering the database, shared storage, and the web tier, full observability, a CI/CD pipeline authenticated via GitHub OIDC (no long-lived AWS credentials), and a documented security review. Not persistently hosted — a public WordPress admin login isn't something worth leaving exposed indefinitely for a demo. Deployable on demand; see [Deploying this yourself](#deploying-this-yourself).
+A production-style three-tier web architecture on AWS — WordPress running behind CloudFront (on a custom domain, `blog.securecloudengineers.com`, with a DNS-validated ACM certificate) and a dedicated WAF Web ACL, on a horizontally-scaled, self-healing web tier that isn't even reachable except through that edge layer, backed by a database that's never directly reachable, splits reads across a cross-AZ read replica, and is shielded from repeat reads by a Redis object cache, with shared state, a daily AWS Backup plan (30-day retention) covering the database, shared storage, and the web tier, full observability, a CI/CD pipeline authenticated via GitHub OIDC (no long-lived AWS credentials), and a documented security review. Not persistently hosted — a public WordPress admin login isn't something worth leaving exposed indefinitely for a demo. Deployable on demand; see [Deploying this yourself](#deploying-this-yourself).
 
 ## What this demonstrates
 
 - Designing a three-tier architecture where the data tier (RDS) is never publicly reachable — only the web tier's security group can reach it, on the database port, nothing else
 - Making a considered build-vs-reuse call on a pre-existing WAF Web ACL from another project in the same account: identifying that reusing it would create cross-stack ownership conflicts and only covers half the requirement (SQLi, not XSS), then building a dedicated one instead of forcing a reuse that looked convenient but wasn't sound
 - Actually closing the bypass a WAF alone doesn't: restricting the ALB's security group to CloudFront's own IP range (an AWS-managed prefix list), since a WAF attached only to CloudFront does nothing if the origin behind it is still directly reachable from the internet
-- Adding a custom domain (`admin.securecloudengineers.com`) with a DNS-validated ACM certificate and a Route 53 record into a hosted zone owned by a *different* project's stack — as a new record, not a modification of that zone's existing records, so it doesn't create the same cross-stack ownership conflict a shared WAF Web ACL would have
+- Adding a custom domain (`blog.securecloudengineers.com`) with a DNS-validated ACM certificate and a Route 53 record into a hosted zone owned by a *different* project's stack — as a new record, not a modification of that zone's existing records, so it doesn't create the same cross-stack ownership conflict a shared WAF Web ACL would have
 - Building for horizontal scale and resilience: an Auto Scaling Group (2-3 instances) across two Availability Zones behind an Application Load Balancer, with shared state (EFS) so any instance can serve any request identically
 - Read/write splitting with a cross-AZ RDS read replica and the HyperDB drop-in — and *proving* it, not just configuring it: measured live `Com_select` counters to confirm reads actually hit the replica (+399 vs. +1 background noise across 15 requests), then confirmed a real WordPress write succeeds only because it reaches the primary, by separately proving a direct write against the replica fails (`read_only` enforced)
 - Adding a Redis object cache (ElastiCache) as a WordPress drop-in (`object-cache.php`) instead of just configuring the connection and hoping — installed the native PhpRedis PHP extension for real performance, and verified `DBSIZE`/key contents directly against Redis after real traffic, not just that the plugin files existed
@@ -29,7 +29,7 @@ A production-style three-tier web architecture on AWS — WordPress running behi
 ```mermaid
 flowchart TB
     Internet((Internet))
-    R53[Route 53<br/>admin.securecloudengineers.com]
+    R53[Route 53<br/>blog.securecloudengineers.com]
     ACM[ACM Certificate<br/>DNS-validated]
     WAF[AWS WAF Web ACL<br/>SQLi + Common/XSS managed rules]
     CF[CloudFront Distribution]
