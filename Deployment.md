@@ -10,7 +10,7 @@ If your account is on the RDS free tier, `DBBackupRetentionPeriod` must stay at 
 
 `KeyPairName` also has no default and must reference an EC2 key pair that already exists in `us-east-1` (see "Create a key pair" below).
 
-`SSHLocationCidr` defaults to `0.0.0.0/0` (open to the internet). Restrict it to your own IP for anything beyond a quick test, e.g. `--parameter-overrides SSHLocationCidr=$(curl -s ifconfig.me)/32 ...`.
+`SSHLocationCidr` defaults to `0.0.0.0/0` (open to the internet). Restrict it to your own IP for anything beyond a quick test, e.g. `--parameter-overrides SSHLocationCidr=$(curl -s ifconfig.me)/32 ...`. **A security review caught this exact gap on the live deployment** — the guidance already existed here, but the running stack had never actually had the override applied, leaving port 22 genuinely open. Fixed the same way: a live parameter-only update (no template change, since `0.0.0.0/0` stays the template's default for anyone else deploying this project from scratch), verified via a reviewed change-set showing only `WebServerSecurityGroup` modified (no replacement), then confirmed directly against the security group afterward that the rule's `CidrIp` actually changed. The IP itself is deliberately not written anywhere in this repo.
 
 ## Git workflow: branch, PR, merge — never push directly to `main`
 
