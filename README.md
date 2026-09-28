@@ -20,6 +20,7 @@ A production-style three-tier web architecture on AWS — WordPress running behi
 - Solving a CloudFormation/RDS ownership conflict (RDS auto-creates its own log group; a plain `AWS::Logs::LogGroup` resource would race it) with a small Lambda-backed custom resource, instead of reaching for a workaround that risks replacing the live database
 - Replacing long-lived AWS credentials with GitHub OIDC role assumption — including tracking down the real cause of a failed `AssumeRoleWithWebIdentity` call via CloudTrail (GitHub's `sub` claim embeds immutable numeric org/repo IDs, not just names)
 - Writing a least-privilege IAM policy for the CI role: scoped to this stack's specific resource ARNs wherever AWS's IAM model supports it, and to a tight action list (not `service:*`) where it doesn't
+- Closing a real gap found in a security review: merging to `main` was the only thing standing between a PR and a live AWS deploy. Added a GitHub Environment-based manual approval gate in front of `deploy.yml` — configured via the API since protection rules aren't expressible in workflow YAML — so shipping is now a deliberate second step, not an automatic side effect of merging
 - Running a security architect review that found and fixed a real input-validation gap (see [Security review](#security-review) below) rather than declaring victory once the feature merely deployed without errors
 - Enforcing the branch/PR policy at the platform level, not just by convention: a branch protection rule on `main` rejects direct pushes outright and requires the CI lint check to pass and the branch to be up to date before merge is even possible — configured to still let a solo maintainer merge their own reviewed PRs (`required_approving_review_count: 0`) rather than accidentally locking the repo owner out
 - Documenting every failure encountered as it happened — root cause and fix, not just the happy path — in [Deployment.md](Deployment.md)
@@ -78,7 +79,8 @@ flowchart TB
 ```mermaid
 flowchart LR
     Push[Push to main] --> GHA[GitHub Actions]
-    GHA -->|OIDC token, sub claim scoped<br/>to this exact repo + branch| STS[AWS STS<br/>AssumeRoleWithWebIdentity]
+    GHA --> Approval{{"Manual approval<br/>(production environment)"}}
+    Approval -->|OIDC token, sub claim scoped<br/>to this exact repo + branch| STS[AWS STS<br/>AssumeRoleWithWebIdentity]
     STS --> Role[GitHubActionsDeployRole<br/>least-privilege, scoped to this stack]
     Role --> Validate[aws cloudformation validate-template]
     Validate --> Deploy[aws cloudformation deploy]
@@ -112,6 +114,7 @@ flowchart LR
 | AWS Backup selects RDS/EFS by explicit ARN but EC2 by tag, not the same mechanism for all three | RDS and EFS are single, fixed resources with known ARNs. EC2 instances are ASG-managed and get replaced over time — a static ARN would silently stop covering new instances, while tag-based selection (the `Name` tag the ASG already propagates at launch) keeps working automatically |
 | The RDS read replica is deliberately excluded from the backup plan | It's derived entirely from the primary via replication, not independent data — restoring it on its own doesn't make sense; recovering the primary and re-creating a replica from it does |
 | ASG has an `UpdatePolicy` (`AutoScalingRollingUpdate`) instead of relying on manual instance refreshes | A launch template change previously sat inert on already-running instances until someone remembered to trigger a refresh by hand — real unpatched-instance risk. `MinInstancesInService` matched to `AsgMinSize` (one below `AsgMaxSize`) means the rolling replacement never dips below the minimum, trading the old manual safety pause for CloudFormation's own rollback-on-failed-health-check behavior |
+| Deploy workflow pauses for manual approval (a GitHub Environment) before touching AWS, on top of branch protection | Branch protection gates what can reach `main`; nothing previously gated the moment `main` actually gets deployed — merging *was* deploying. The environment's required reviewer is configured via the GitHub API, not a file in this repo, since protection rules aren't expressible in workflow YAML |
 | `DBPassword`'s `AllowedPattern` excludes `'` and `\`, not just `/`, `@`, `"`, and whitespace | Found during a security review: `db-config.php` embeds the password inside a single-quoted PHP string literal, so an unescaped `'` in a chosen password would cause a fatal PHP parse error on every instance boot — a self-inflicted outage from an otherwise-valid password. The older `wp-config.php` `sed` substitution wasn't vulnerable to this specific character |
 
 ## Security review
