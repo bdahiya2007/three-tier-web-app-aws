@@ -44,3 +44,6 @@ Thumbs.db
 
 # --- Logs / temp output ---
 *.log
+
+# --- Local-only tracking files ---
+TODO.md
