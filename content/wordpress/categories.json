@@ -1,0 +1,16 @@
+[
+  {
+    "description": "",
+    "id": 3,
+    "name": "Cloud Architecture",
+    "parent": 0,
+    "slug": "cloud-architecture"
+  },
+  {
+    "description": "",
+    "id": 1,
+    "name": "Uncategorized",
+    "parent": 0,
+    "slug": "uncategorized"
+  }
+]

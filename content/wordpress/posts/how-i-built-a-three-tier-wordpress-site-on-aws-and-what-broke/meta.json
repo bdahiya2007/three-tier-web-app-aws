@@ -1,0 +1,19 @@
+{
+  "categories": [
+    3
+  ],
+  "comment_status": "open",
+  "date_gmt": "2026-09-28T00:32:12",
+  "excerpt": "",
+  "featured_media": 0,
+  "format": "standard",
+  "id": 88,
+  "ping_status": "open",
+  "slug": "how-i-built-a-three-tier-wordpress-site-on-aws-and-what-broke",
+  "status": "publish",
+  "sticky": false,
+  "tags": [],
+  "template": "",
+  "title": "How I Built a Three-Tier WordPress Site on AWS (and What Broke)",
+  "type": "post"
+}
