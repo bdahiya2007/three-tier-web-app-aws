@@ -13,7 +13,6 @@ name: Deploy CloudFormation Stack
 # Required GitHub repository secrets (Settings -> Secrets and variables -> Actions):
 #   AWS_DEPLOY_ROLE_ARN - the DeployRoleArn output of the pipeline stack, e.g.
 #                         arn:aws:iam::<account-id>:role/three-tier-app-pipeline-deploy-role
-#   DB_PASSWORD         - value for the CloudFormation DBPassword parameter (8-41 chars, no / @ " ' \ or spaces)
 #   KEY_PAIR_NAME       - name of an existing EC2 key pair in us-east-1 (CloudFormation KeyPairName parameter)
 
 on:
@@ -82,7 +81,6 @@ jobs:
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset \
             --parameter-overrides \
-              DBPassword=${{ secrets.DB_PASSWORD }} \
               KeyPairName=${{ secrets.KEY_PAIR_NAME }}
 
       - name: Show stack outputs

@@ -57,16 +57,6 @@ Parameters:
     Description: Master username for the RDS instance.
     NoEcho: true
 
-  DBPassword:
-    Type: String
-    # ' and \ excluded: embedded in a single-quoted PHP string (and JSON).
-    # Only seeds DBMasterSecret now; instances read the secret, not this.
-    Description: RDS master password (8-41 chars, no / @ " ' \ spaces)
-    NoEcho: true
-    MinLength: 8
-    MaxLength: 41
-    AllowedPattern: "[^/@\"'\\\\\\s]*"
-
   DBInstanceClass:
     Type: String
     Default: db.t3.micro
@@ -297,14 +287,19 @@ Resources:
       SubnetId: !Ref PrivateSubnet2
       RouteTableId: !Ref PrivateRouteTable
 
-  # Seeded from DBPassword so this first switch changes nothing; rotating to a
-  # generated value is a separate, later step (see Deployment.md).
+  # Generated, never supplied by anyone. / @ " and space are RDS-disallowed;
+  # ' and \ would break the single-quoted PHP string in db-secret.php.
+  # Later rotations: see "Rotate the DB password" in Deployment.md.
   DBMasterSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
       Name: !Sub ${EnvironmentName}-db-master
       Description: RDS master credentials; WordPress instances read this at runtime.
-      SecretString: !Sub '{"username":"${DBUsername}","password":"${DBPassword}"}'
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DBUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '/@"''\ '
 
   # Sent by CloudFront as X-Origin-Verify, so the ALB can reject requests that
   # came through any other CloudFront distribution.
@@ -1156,7 +1151,11 @@ Resources:
       DBInstanceClass: !Ref DBInstanceClass
       AllocatedStorage: !Ref DBAllocatedStorage
       MasterUsername: !Ref DBUsername
-      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBMasterSecret}:SecretString:password}}'
+      # CloudFormation only re-applies this when the reference *text* changes, not
+      # when the secret's value does - the explicit :AWSCURRENT was added in the
+      # same change that switched DBMasterSecret to a generated value, so RDS got
+      # the new password (see "Rotate the DB password" in Deployment.md).
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBMasterSecret}:SecretString:password:AWSCURRENT}}'
       DBSnapshotIdentifier: !If [RestoreFromSnapshot, !Ref DBSnapshotIdentifier, !Ref 'AWS::NoValue']
       DBSubnetGroupName: !Ref DBSubnetGroup
       VPCSecurityGroups:
