@@ -27,6 +27,8 @@ A production-style three-tier web architecture on AWS — WordPress running behi
 - Diagnosing an unexpected RDS bill from first principles: an AWS Billing chart showing a disproportionate charge for two brand-new, tiny database instances turned out to be RDS's Extended Support surcharge for a MySQL major version that had quietly exited standard support — found by cross-referencing the account's actual engine version and AWS's published per-vCPU-hour rate, not by guessing, then fixed with an in-place major-version upgrade and hitting (then solving) a real CloudFormation/RDS ordering conflict between the primary and its read replica along the way
 - Running a security architect review that found and fixed a real input-validation gap (see [Security review](#security-review) below) rather than declaring victory once the feature merely deployed without errors
 - Enforcing the branch/PR policy at the platform level, not just by convention: a branch protection rule on `main` rejects direct pushes outright and requires the CI lint check to pass and the branch to be up to date before merge is even possible — configured to still let a solo maintainer merge their own reviewed PRs (`required_approving_review_count: 0`) rather than accidentally locking the repo owner out
+- A second, stack-wide security review that found issues hiding in plain sight: the DB master password was being written to CloudWatch Logs by `bash -x` tracing in `UserData` (confirmed by counting matching log events, never printing them), and the CI deploy role could grant *itself* admin, because a role that deploys its own permissions can always escalate them. Fixed the second one structurally rather than with tighter conditions: the role moved to a separate, manually deployed stack with an explicit self-Deny, and a permissions boundary caps every role it can grant to
+- Outgrowing CloudFormation's 51,200-byte inline template limit (hit twice: a 3-line fix passed `cfn-lint`, merged, then failed on deploy) and fixing it properly: deploys now go through a stack-owned S3 bucket (1 MB limit), with a PR-time size check so the next overflow fails before merge, not after
 - Documenting every failure encountered as it happened — root cause and fix, not just the happy path — in [Deployment.md](Deployment.md)
 
 ## Architecture
@@ -140,11 +142,16 @@ Adding the RDS read replica was followed by a dedicated security/architecture re
 **Found and fixed**:
 - `DBPassword`'s `AllowedPattern` didn't exclude `'` or `\`, which could break `db-config.php`'s PHP string literal and take the site down on a future password rotation — see the table above.
 - The DB master password was leaking into CloudWatch Logs: `UserData` runs under `bash -x`, which echoed the `sed` line writing the password into `wp-config.php` into `cloud-init-output.log` — a log group the CloudWatch agent ships off-instance. Confirmed on the live stack by counting matching log events (without printing them), fixed by disabling tracing around the credential lines. The fix only stops new leaks — already-written log events and the password itself must be treated as exposed (delete the old streams, rotate the password) — see [Deployment.md](Deployment.md#the-db-password-used-to-leak-into-the-cloud-init-log).
-- The CI deploy role could grant itself admin: its IAM permissions covered `role/three-tier-app-*`, which matched its own name, because it had to update its own policy through CloudFormation. It now lives in a separate, manually deployed `pipeline.yaml` stack with an explicit self-Deny. Any IAM grant it makes has to carry a permissions boundary that caps the result at the app's own needs — see [Deployment.md](Deployment.md#why-the-deploy-role-lives-in-its-own-stack).
+- The CI deploy role could grant itself admin: its IAM permissions covered `role/three-tier-app-*`, which matched its own name, because it had to update its own policy through CloudFormation. It now lives in a separate, manually deployed `pipeline.yaml` stack with an explicit self-Deny. Any IAM grant it makes has to carry a permissions boundary that caps the result at the app's own needs — see [Deployment.md](Deployment.md#why-the-deploy-role-lives-in-its-own-stack). Verified with `iam simulate-principal-policy` against the live role: modifying itself or removing a boundary is an explicit deny. The first deploy after the move failed on a duplicate backup selection, and its rollback then got stuck, because the same Deny also blocks CloudFormation from *undoing* a boundary. Recovered with an admin `continue-update-rollback --resources-to-skip`, which kept the boundary in place — see [Deployment.md](Deployment.md#first-deploy-after-the-move-two-failures-and-a-stuck-rollback).
 
 **Found, not yet fixed (flagged for a deliberate decision, not an oversight)**:
 - Neither RDS instance is encrypted at rest. This predates the replica, but a replica must match its source's encryption status, so the gap is now on two instances instead of one. Remediation requires snapshot → restore-as-encrypted for the primary (a new endpoint, genuinely disruptive) before the replica could be recreated encrypted too.
 - No TLS enforcement in transit between WordPress and RDS (`require_secure_transport` unset). Partially mitigated by VPC-level network isolation, but doesn't meet defense-in-depth for data-in-transit on its own.
+- The DB password is still plaintext in the launch template's `UserData` (planned: Secrets Manager, which also rotates it).
+- Redis has no encryption or AUTH token; the ALB accepts traffic from *any* CloudFront distribution, not just this one (a WAF bypass path); the WAF has no rate limiting, WordPress-specific rules or logging; RDS has no deletion protection; WordPress uses the DB master user.
+- Accepted rather than planned: web servers in public subnets (a NAT Gateway would roughly double the running cost).
+
+The complete list, with verification commands and planned fixes, is in [Deployment.md](Deployment.md#known-security-gaps-not-yet-remediated--flagged-for-a-decision-not-overlooked).
 
 Full methodology (exact commands, the counter values, the `read_only` proof) is in [Deployment.md](Deployment.md#rds-read-replica-and-wordpress-readwrite-splitting).
 
@@ -184,6 +191,15 @@ Getting the OIDC piece working for real surfaced two failures worth calling out:
 See [Deployment.md](Deployment.md) for the full guide — every parameter, the GitHub Actions/OIDC one-time setup, connecting to the database, viewing logs and the dashboard, and the full troubleshooting log. Quick version:
 
 ```bash
+# 1. Pipeline stack first (deploy role, Backup role, permissions boundary) - the app stack imports its exports
+aws cloudformation deploy \
+  --template-file cloudformation/pipeline.yaml \
+  --stack-name three-tier-app-pipeline \
+  --region us-east-1 \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides GitHubRepo=<your-repo-name> GitHubRepoId=<your-repo-id>
+
+# 2. Then the app stack
 aws cloudformation deploy \
   --template-file cloudformation/vpc.yaml \
   --stack-name three-tier-app-network \

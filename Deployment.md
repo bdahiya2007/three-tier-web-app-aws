@@ -63,6 +63,19 @@ A failed `deploy` on an already-existing stack typically leaves it in `UPDATE_RO
 
 ## Deploy the stack
 
+There are two stacks, and **order matters**. Deploy the pipeline stack first (deploy role, Backup service role, permissions boundary). The app stack imports its exports and fails with `No export named three-tier-app-pipeline-... found` without it. See "Why the deploy role lives in its own stack" for why they're separate.
+
+```bash
+aws cloudformation deploy \
+  --template-file cloudformation/pipeline.yaml \
+  --stack-name three-tier-app-pipeline \
+  --region us-east-1 \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides GitHubRepo=<your-repo-name> GitHubRepoId=<your-repo-id>
+```
+
+Then the app stack:
+
 ```bash
 aws cloudformation deploy \
   --template-file cloudformation/vpc.yaml \
@@ -632,6 +645,13 @@ If the SQLi/XSS requests return `200` instead of `403`, the rules aren't actuall
 - **The read replica needs the same treatment, explicitly, and RDS enforces an update order CloudFormation can't express in one stack update**: a `DBInstance` update that only changes its own `EngineVersion` fails with `One or more of the DB Instance's read replicas need to be upgraded: <replica-id>` if a replica is still on the old major version. The natural fix — also setting `EngineVersion`/`AllowMajorVersionUpgrade` on `DBReadReplica` — doesn't fully solve it either, because `DBReadReplica`'s `SourceDBInstanceIdentifier` makes it *depend on* `DBInstance` in CloudFormation's graph, so CFN always tries to update the primary first, hitting the same guard rail every time. RDS's own requirement is the opposite order: **the replica must reach the target version before the primary does**, and CloudFormation has no way to express "update the dependent resource before the resource it depends on" here. The actual fix: upgrade the replica directly first, out-of-band (`aws rds modify-db-instance --db-instance-identifier <replica-id> --engine-version 8.4 --allow-major-version-upgrade --apply-immediately`), wait for it to reach `available`, *then* deploy the stack update for the primary — which then succeeds since the replica already satisfies RDS's requirement. The template still declares `EngineVersion`/`AllowMajorVersionUpgrade` on both resources (so future deploys/replacements get it correctly and there's no permanent drift from the template's declared state), it's specifically the *upgrade sequencing* that has to happen outside CloudFormation.
 - **How this was actually verified, not just deployed**: after both instances reported `available`, connected directly and ran `SELECT VERSION()` against both (`8.4.9`), confirmed the replica's `read_only=ON` fail-safe survived the upgrade, confirmed a direct write to the replica still correctly fails with the same `ERROR 1290` as before, and confirmed `Com_select` on the replica was still climbing (real read traffic still routing there) — the same verification standard as the original HyperDB setup, re-run after a major infrastructure change instead of assumed to still hold.
 - **Separate gotcha surfaced along the way: Cost Explorer's API (`aws ce get-cost-and-usage`) returned near-zero data for the entire account**, while the Billing console's "Cost summary"/"Cost breakdown" widgets showed real, accurate figures for the same period. These are different AWS systems — Cost Explorer requires an explicit one-time enable and can take up to 24 hours to backfill data even after that, while the classic Billing dashboard is always-on. On a newer account, don't trust an empty/zero Cost Explorer API response as "no cost" — cross-check against the Billing console directly.
+- **Correction, found later: on this account the near-zero numbers were credits, not missing data.** The account is on AWS's **Free plan** (`aws freetier get-account-plan-state` → `accountPlanType: FREE`, with a remaining credit balance and an expiry date). Free-plan credits are applied as `Credit` line items that cancel out each service's usage, so a per-service `UnblendedCost` grouping sums to ~$0 even while real usage accrues. The real usage only appears when you filter out credits:
+  ```bash
+  aws ce get-cost-and-usage --time-period Start=2026-09-01,End=2026-09-29 --granularity MONTHLY \
+    --metrics UnblendedCost --group-by Type=DIMENSION,Key=SERVICE \
+    --filter '{"Dimensions":{"Key":"RECORD_TYPE","Values":["Usage"]}}'
+  ```
+  Measured this way: September's usage was **$23.22**, of which **$14.18 (61%) was `ExtendedSupport:Yr1-Yr2:MySQL8.0`**, peaking around **$9/day**. It dropped to ~$0 right after the 8.4 upgrade. Without Extended Support, the full stack runs at roughly $2–3/day of credits. **When Free plan credits run out (or the plan's 6 months end), AWS requires upgrading to a paid plan or the account is closed**, so watch the remaining balance, not just the bill. Each Cost Explorer API call costs $0.01.
 
 ### Verify direct ALB access is actually blocked (the bypass is actually closed)
 
@@ -791,10 +811,18 @@ If a real `$wpdb` write through WordPress succeeds without error (it does), and 
 
 ### Known security gaps (not yet remediated — flagged for a decision, not overlooked)
 
-Found during a security architect review of this feature, deliberately left as-is pending a decision rather than fixed silently:
+Found during security architect reviews (the first for this feature; a second, stack-wide pass added the items after the first two), deliberately left as-is pending a decision or a planned fix rather than fixed silently:
 
 - **Neither RDS instance is encrypted at rest** (`StorageEncrypted: false` on both). Check with `aws rds describe-db-instances --query "DBInstances[].[DBInstanceIdentifier,StorageEncrypted]"`. This predates the replica, but a read replica must match its source's encryption status — so adding the replica locked this gap into two instances instead of one. Remediation requires snapshot → restore-as-encrypted for the primary (a genuinely disruptive operation — new endpoint, same complexity class as the earlier snapshot-restore work in this file), then recreating the replica from the now-encrypted primary.
 - **No TLS enforcement in transit** between the web tier and either RDS instance (`require_secure_transport` unset, using the MySQL engine default). Check with `aws rds describe-db-parameters --db-parameter-group-name <group> --query "Parameters[?ParameterName=='require_secure_transport']"`. Partially mitigated by VPC-level network isolation (unreachable from outside the VPC regardless), but doesn't meet defense-in-depth for data-in-transit on its own. Lower-risk to remediate than the encryption gap — a parameter group change plus adding SSL context to the MySQL/HyperDB connections, no instance replacement needed.
+- **The DB master password is still plaintext in the launch template's `UserData`** (every version), readable by anyone with `ec2:DescribeLaunchTemplateVersions`, and in `wp-config.php`/`db-config.php` on each instance. The CloudWatch Logs leak is fixed (see "The DB password used to leak into the cloud-init log"), but the password itself must be treated as exposed until rotated. **Planned:** move it to Secrets Manager, fetched at boot through the instance role, which also generates a new password.
+- **Redis has no encryption in transit, at rest, or AUTH token** (`describe-cache-clusters`: `TransitEncryptionEnabled`/`AtRestEncryptionEnabled`/`AuthTokenEnabled` all `false`). Only `RedisSecurityGroup` protects it. **Planned:** an encrypted `ReplicationGroup` with TLS and an AUTH token. At-rest encryption can't be enabled on a `CacheCluster`.
+- **The ALB accepts any CloudFront distribution, not just this one.** The origin-facing prefix list covers all of CloudFront, so someone else's distribution pointed at the ALB could bypass this stack's WAF. **Planned:** a secret custom origin header from CloudFront, with the ALB listener returning a fixed 403 without it.
+- **The WAF has no rate limiting and no WordPress/PHP-specific rules** (`wp-login.php`/`xmlrpc.php` brute force is unmitigated), **no logging configuration** (only metrics and sampled requests), and the `CrossSiteScripting_BODY` exemption matches `/wp-json/wp/v2/` with `CONTAINS` rather than `STARTS_WITH`.
+- **No RDS deletion protection, no Multi-AZ** on the primary. Deletion protection is a one-line fix. Multi-AZ roughly doubles RDS cost.
+- **WordPress connects as the RDS master user**, not a least-privilege application user.
+- **Smaller hardening items:** no explicit `MetadataOptions` (IMDSv2 is enforced today only by the AL2023 AMI default), plain HTTP on the in-VPC ALB→instance hop, unpinned WordPress/plugin downloads with no checksum, `chmod -R 755` leaving config files world-readable, no CloudFront security-headers policy, no `aws:SecureTransport` deny on the ALB logs bucket, GitHub Actions pinned by tag rather than SHA, and `DB_PASSWORD` interpolated straight into a `run:` shell line.
+- **Accepted, not planned:** web servers in public subnets. Moving them to private subnets needs a NAT Gateway (~$33/month + $0.045/GB), which would roughly double the running cost; the security groups already limit HTTP to the ALB and SSH to one IP.
 
 ### Known limitation: replication lag
 
@@ -999,6 +1027,20 @@ Every issue actually hit while building and operating this stack, with symptom �
 - **Cause**: the PR is in a `DIRTY`/`CONFLICTING` merge state relative to `main` (check with `gh pr view <number> --json mergeable,mergeStateStatus`). GitHub doesn't reliably fire `pull_request` check runs against a PR that can't currently be merged — this happens most often when two branches were both open at once and one of them merged first, leaving the other's diff colliding with the new `main`. It looks exactly like a CI/workflow bug from the outside (no error, just silence), but it isn't one.
 - **Fix**: resolve the conflict — `git fetch origin main && git rebase origin/main`, resolve any conflict markers, `git push --force-with-lease` (safe on your own feature branch, not on `main`). Once `mergeable` flips back to `MERGEABLE`, checks start firing normally again on the very next push, with no other change needed.
 - **General lesson**: keep feature branches short-lived and rebase before starting new work if another PR might land first (see "Git workflow" above) — this class of conflict is much rarer the fewer long-lived parallel branches exist touching the same files.
+
+### App stack deploy fails: "No export named three-tier-app-pipeline-... found"
+
+- **Symptom**: the deploy workflow fails right after "Waiting for stack create/update to complete". The stack goes to `UPDATE_ROLLBACK_COMPLETE` with the reason `No export named three-tier-app-pipeline-backup-role-arn found`.
+- **Cause**: the app stack's `Fn::ImportValue`s reference the pipeline stack's exports, and the pipeline stack didn't exist yet. This really happened: PR #25 (which introduced `pipeline.yaml`) was merged *before* its "deploy the pipeline stack first" steps were run, so the merge-triggered deploy ran too early.
+- **Fix**: deploy `pipeline.yaml` (see "One-time AWS-side setup"), update `AWS_DEPLOY_ROLE_ARN`, then re-run the failed workflow run (`gh run rerun <run-id>`, or "Re-run jobs" in the Actions tab). Nothing needs reverting: the failure happens before any resource changes. A re-run reads the secret when its "Configure AWS credentials" step runs (after approval), not when the run was first created, so it picks up the new role ARN.
+- **General lesson**: when a PR needs manual steps before its deploy, merging *is* the trigger. Do the steps first, then merge.
+
+### Retargeting a stacked PR's base branch doesn't run the `validate` check
+
+- **Symptom**: after the PR it was stacked on merges, a PR is retargeted to `main` (`gh api -X PATCH .../pulls/<n> -f base=main`) and marked ready, but no `validate` check appears, so the PR stays `BLOCKED`.
+- **Cause**: `validate.yml` triggers on `pull_request` with the default activity types (`opened`, `synchronize`, `reopened`). Changing the base branch fires an `edited` event, which isn't in that list.
+- **Fix**: close and reopen the PR (`gh pr close <n> && gh pr reopen <n>`). That fires `reopened` without touching the branch's commits. Pushing a new commit (`synchronize`) also works.
+- **Side note**: `gh pr edit` can fail outright on some `gh` versions with a GraphQL "Projects (classic) is being deprecated" error. The REST call above works regardless.
 
 ### cfn-lint W3005 / W1011 findings on pull requests
 
@@ -1278,9 +1320,17 @@ The `deploy` job in `deploy.yml` targets a GitHub Environment named `production`
 
 ## Delete the stack
 
+Delete the app stack first. The pipeline stack can't be deleted while the app stack still imports its exports.
+
 ```bash
 aws cloudformation delete-stack \
   --stack-name three-tier-app-network \
+  --region us-east-1
+aws cloudformation wait stack-delete-complete --stack-name three-tier-app-network --region us-east-1
+
+# only if you're done with CI/CD for this account too:
+aws cloudformation delete-stack \
+  --stack-name three-tier-app-pipeline \
   --region us-east-1
 ```
 
