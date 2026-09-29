@@ -807,6 +807,8 @@ aws secretsmanager put-secret-value --secret-id $SECRET --region $R \
 
 Expect up to about a minute of "Error establishing a database connection" between the two changes taking effect. The read replica picks up the new password through replication. Don't print `$NEW`.
 
+**Then verify with a real login**, not by loading the site. The Redis object cache can keep pages working while the database rejects every connection (see "Site loads fine, but logins and writes fail" in Troubleshooting). Run the direct `mysql` check from that entry against both endpoints.
+
 **Don't rotate by editing the template.** CloudFormation doesn't re-apply `MasterUserPassword` when only the secret's *value* changes; see "Changing the secret didn't change the RDS password" in Troubleshooting. Doing it out of band like this is safe: CloudFormation doesn't track the secret's value, so later deploys won't revert it.
 
 ## Connect to WordPress users
@@ -1001,7 +1003,7 @@ The RDS master password lives in the Secrets Manager secret **`three-tier-app-db
 
 **Migration without downtime:** the secret was first **seeded with the existing `DBPassword` value**, so switching RDS and the instances to it changed nothing. Rotating to a new random value is a separate step. Doing both at once would have changed the RDS password while the old instances (being replaced one at a time over about 20 minutes) still had the old one baked in.
 
-**Step 2, the rotation:** `DBMasterSecret` switched from `SecretString` (seeded from the old `DBPassword` parameter) to `GenerateSecretString`, and the `DBPassword` parameter and `DB_PASSWORD` GitHub secret were removed. CloudFormation generated a new value, then modified RDS to match. Running instances picked it up on their next timer run. **One catch that would have taken the site down:** RDS's `MasterUserPassword` reference text had to change too (see the next Troubleshooting entry). A preview change set (`create-change-set`, reviewed, then deleted without executing) confirmed `DBInstance: Modify MasterUserPassword` before merging.
+**Step 2, the rotation, and what went wrong:** `DBMasterSecret` switched from `SecretString` (seeded from the old `DBPassword` parameter) to `GenerateSecretString`, and the `DBPassword` parameter and `DB_PASSWORD` GitHub secret were removed. The deploy succeeded, the homepage returned 200, and it was reported as verified. **It wasn't working.** RDS never got the new password. CloudFormation did modify `DBInstance.MasterUserPassword` (forced by an explicit `:AWSCURRENT`, see Troubleshooting), but not with the value the secret ended up holding. The instances switched to the new value within a minute, so **every DB login failed**, and nobody noticed: the Redis object cache kept serving pages, and nothing writes to the database until someone logs in. It surfaced about 45 minutes later as the Two Factor plugin's *"Failed to create a login nonce"* on a real login. A direct `mysql` login from an instance confirmed both primary and replica rejected the secret's password. Fixed with the documented recovery (set RDS from the secret, see "Rotate the DB password"), then re-verified with the same direct login. **Consequence:** the leaked password stayed valid for about 45 minutes longer than reported.
 
 **Deploy order for this change:** the deploy role needed new `secretsmanager` permissions in `pipeline.yaml`. That stack is admin-deployed, so redeploy it **before** merging an app-stack change that adds secrets:
 
@@ -1026,8 +1028,8 @@ grep -n "DB_PASSWORD\|db-secret" /var/www/html/wp-config.php   # only the requir
 ### WordPress REST API ignores an Application Password ("not allowed to edit posts in this post type")
 
 - **Symptom**: an authenticated request (`curl -u user:app-password ...?context=edit`) comes back as if anonymous: `rest_forbidden_context`. Even a deliberately wrong username gets the same answer instead of `invalid_username`, which proves WordPress never saw the header at all.
-- **Cause, two layers**: (1) **Apache**: `mod_proxy_fcgi` doesn't pass `Authorization` to PHP-FPM unless told to. WordPress's own `.htaccess` normally adds a rewrite for this, but plain permalinks have no `.htaccess`. (2) **CloudFront** strips `Authorization` from GET/HEAD requests unless it's part of the cache key. The first probe here went through as a POST (`?_method=GET`, which WordPress treats as a read) and was *still* ignored, which pinned the problem on Apache.
-- **Fix**: `UserData` writes `/etc/httpd/conf.d/wordpress-auth.conf` with `CGIPassAuth On` for `/var/www/html`. For the CloudFront layer, `scripts/wp_content.py` sends every authenticated read as `POST ...?_method=GET`, so no CloudFront or cache-policy change was needed. (Adding `Authorization` to a cache policy would have meant turning CloudFront caching back on.)
+- **Cause, two layers**: (1) **Apache**: `mod_proxy_fcgi` doesn't pass `Authorization` to PHP-FPM unless told to. WordPress's own `.htaccess` normally adds a rewrite for this, but plain permalinks have no `.htaccess`. (2) **CloudFront** strips `Authorization` from GET/HEAD req- **Testing it**: use a **real** Application Password: run `content-backup.yml`, or `scripts/wp_content.py export` locally. A probe with a *fake* username (`curl -u nosuchuser:... ?context=edit`) is **not** a reliable test. Before any Application Password existed, WordPress skipped Application Password checks entirely (`WP_Application_Passwords::is_in_use()`), and even afterwards the fake-user probe kept returning `rest_forbidden_context` while real-credential exports worked.
+scripts/wp_content.py` sends every authenticated read as `POST ...?_method=GET`, so no CloudFront or cache-policy change was needed. (Adding `Authorization` to a cache policy would have meant turning CloudFront caching back on.)
 - **Probe without real credentials**:
   ```bash
   curl -s -X POST -u "nosuchuser:xxxx xxxx xxxx xxxx xxxx xxxx" \
@@ -1174,19 +1176,31 @@ Every issue actually hit while building and operating this stack, with symptom �
 - **Context**: `DBInstance` has `EnableCloudwatchLogsExports: [error]`, which makes RDS create a CloudWatch Logs group automatically, with default (never expire) retention. A plain `AWS::Logs::LogGroup` resource (like `HttpdErrorLogGroup`/`CloudInitLogGroup`) can't be used to manage it directly.
 - **Why not**: The log group's name depends on the DB instance's identifier (`/aws/rds/instance/<identifier>/error`), and `DBInstance` doesn't set an explicit `DBInstanceIdentifier` — AWS auto-generates one. A CloudFormation-managed `AWS::Logs::LogGroup` would have to `DependsOn: DBInstance` to know the name, but by the time `DBInstance` finishes creating, RDS has typically already auto-created that same log group as a side effect of enabling the export — so the CloudFormation resource creation fails with "already exists." Giving `DBInstance` an explicit `DBInstanceIdentifier` to work around the naming problem isn't an option either: that property is immutable and triggers replacement, so adding it to an already-running stack would **replace the live database**.
 - **Fix**: `DBErrorLogRetention` (`Custom::SetRdsLogRetention`), backed by the `RdsLogRetentionFunction` Lambda, calls `logs:PutRetentionPolicy` directly via the API instead of declaring the log group as a CloudFormation-managed resource. This works whether the log group already exists or not — the call is idempotent, and the Lambda retries (up to 10 times, 6s apart) if the log group doesn't exist yet when it first runs. No naming conflict, no `DBInstanceIdentifier` change, no replacement risk.
-- If you ever need to set it manually (e.g. testing before this Lambda existed): `aws logs put-retention-policy --log-group-name /aws/rds/instance/<db-instance-identifier>/error --retention-in-days 7 --region us-east-1`
+- If you ever need to set it manually (e.g. testing before### Changing the secret through CloudFormation left RDS on a different password
 
-### RDS create fails: "backup retention period exceeds the maximum available to free tier customers"
+- **What happened**: a template change switched `DBMasterSecret` to `GenerateSecretString`, and `DBInstance`'s `MasterUserPassword: '{{resolve:secretsmanager:...}}'` reference text was deliberately changed too (`...:password}}` → `...:password:AWSCURRENT}}`). The reasoning: CloudFormation compares *template text*, not resolved values, so without a text change `DBInstance` wouldn't be updated at all. A preview change set confirmed `Modify DBInstance: MasterUserPassword`, and the deploy did modify it. **But afterwards, RDS rejected the secret's new password** (a direct `mysql` login from an instance got `ERROR 1045 Access denied` on both primary and replica).
+- **Most likely cause**: CloudFormation resolved the dynamic reference **before** it updated the secret in the same operation, so RDS got the pre-rotation value. CloudTrail can't confirm the exact value (the password is redacted in the `ModifyDBInstance` event). What's certain is that RDS and the secret disagreed right after a "successful" deploy.
+- **Fix**: set RDS from the secret, then verify with a direct login (below). No instance changes are needed, because they already read the secret.
+- **General lesson**: **don't change a secret's value and a resource that `{{resolve:...}}`s it in the same CloudFormation operation.** For rotation, don't use CloudFormation at all: change RDS and the secret directly (see "Rotate the DB password"). **After any password change, verify with a real login to both endpoints from an instance, never with "the site loads".** See the next entry for why.
 
-- **Symptom**: `DBInstance CREATE_FAILED` with that exact message in `describe-stack-events`.
-- **Cause**: `BackupRetentionPeriod` was set above what a free-tier account allows.
-- **Fix**: Keep `DBBackupRetentionPeriod` at its default (`1`). Only raise it once the account is off the RDS free tier.
+### Site loads fine, but logins and writes fail: Redis is hiding a dead database connection
 
-### Changing the secret didn't change the RDS password (dynamic references aren't re-resolved)
+- **Symptom**: pages and the REST API return 200 and look normal, but logging in fails. With the Two Factor plugin you get *"Failed to create a login nonce."* (it can't save its one-time token), and without it, a DB error appears on login or on anything that writes.
+- **Cause**: the Redis object cache holds WordPress's options, posts and query results. Anonymous page views can be served almost entirely from Redis, so a WordPress that can't authenticate to MySQL at all still serves the site. A login is the first thing that must hit the database.
+- **Diagnose**: test the actual thing, a MySQL login with the password the instance really has (it's never printed):
+  ```bash
+  ssh -i <key>.pem ec2-user@<instance-public-ip> 'bash -s' <<'EOF'
+  export MYSQL_PWD=$(sudo php -r 'include "/etc/wordpress/db-secret.php"; echo DB_PASSWORD;')
+  U=$(sudo sed -n "s/.*'DB_USER', '\([^']*\)'.*/\1/p" /var/www/html/wp-config.php)
+  for h in <primary-endpoint> <replica-endpoint>; do
+    echo "== $h"; mysql -h "$h" -u "$U" -N -e "SELECT 'login OK', @@read_only" 2>&1 | tail -1
+  done
+  EOF
+  ```
+  `ERROR 1045 Access denied` means RDS and the secret disagree: set RDS from the secret (see "Rotate the DB password"). `login OK` on both (primary `read_only` 0, replica 1) means the DB side is fine.
+- **Monitoring hint**: the primary's `DatabaseConnections` metric sat at about 1 the whole time, because reads go to the replica and there were no writes. That isn't an alarm signal on its own at this traffic level.
 
-- **Symptom (caught in review, before it shipped)**: a template change makes the DB secret generate a new value, but `DBInstance`'s `MasterUserPassword: '{{resolve:secretsmanager:...}}'` text stays the same. The secret changes, RDS doesn't, instances fetch the new value within a minute, and every DB login fails.
-- **Cause**: CloudFormation compares *template text*, not resolved values. **A dynamic reference whose target value changed is not a change to the resource**, so `DBInstance` isn't updated at all.
-- **Fix used**: in the same change, alter the reference text without changing its meaning. `...:SecretString:password}}` became `...:SecretString:password:AWSCURRENT}}` (the explicit version stage). CloudFormation then sees a `MasterUserPassword` change and resolves it *after* updating the secret, because the reference `!Sub`s the secret's ARN and so depends on it.
+s it *after* updating the secret, because the reference `!Sub`s the secret's ARN and so depends on it.
 - **How it was confirmed before merging**: `aws cloudformation create-change-set` against the live stack (all parameters `UsePreviousValue`), then `describe-change-set` showed `Modify DBInstance: MasterUserPassword` and `Modify DBMasterSecret: GenerateSecretString,SecretString`. The change set was deleted without executing.
 - **General lesson**: for later rotations, don't edit the template. Change RDS and the secret directly (see "Rotate the DB password").
 
