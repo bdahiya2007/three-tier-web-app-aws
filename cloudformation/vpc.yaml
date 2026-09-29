@@ -83,9 +83,7 @@ Parameters:
   RedisNodeType:
     Type: String
     Default: cache.t3.micro
-    Description: >-
-      ElastiCache node type for the Redis object cache. cache.t3.micro is eligible
-      for the ElastiCache free tier (750 hrs/month) on a new AWS account.
+    Description: Redis node type (cache.t3.micro is free-tier eligible).
 
   RedisEngineVersion:
     Type: String
@@ -171,17 +169,12 @@ Parameters:
   CustomDomainName:
     Type: String
     Default: blog.securecloudengineers.com
-    Description: >-
-      Custom domain for CloudFront, alongside its default *.cloudfront.net domain.
-      Must be a subdomain of Route53HostedZoneId's zone; its ACM cert is DNS-validated
-      automatically.
+    Description: CloudFront custom domain, in Route53HostedZoneId's zone (ACM DNS-validated).
 
   Route53HostedZoneId:
     Type: String
     Default: Z06930743HC9RLGHJO306
-    Description: >-
-      Hosted zone ID for securecloudengineers.com, owned by a separate stack. Only
-      a new record is added here - the zone itself isn't owned or modified.
+    Description: Existing hosted zone (another stack owns it; only records are added).
 
   GitHubOrg:
     Type: String
@@ -383,10 +376,8 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-alb-sg
 
-  # No port-80 rule: the prefix list has 46 entries, and each rule referencing it
-  # consumes 46 rule slots against the 60-per-SG quota - a second (80+443) rule
-  # would exceed it. Moot anyway: CloudFront's origin is https-only, so it never
-  # sends port-80 traffic to the ALB regardless of what the SG allows.
+  # 443 only: the 46-entry prefix list uses 46 of the SG's 60 rule slots, so an
+  # 80 rule can't fit - and CloudFront's https-only origin never sends port 80.
   ALBSecurityGroupIngressHttpsFromCloudFront:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -417,6 +408,26 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub ${EnvironmentName}-alb-logs
+
+  # deploy.yml uploads the template here (--s3-bucket) to get past TemplateBody's
+  # 51,200-byte limit. Auto-named, so it matches the deploy role's S3 scope.
+  CfnArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldTemplates
+            Status: Enabled
+            ExpirationInDays: 7
 
   ALBLogsBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -487,8 +498,7 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-tg
 
-  # Only listener - no port 80 at all, since the security group only allows 443
-  # (see above) and CloudFront's origin is https-only; nothing can ever reach 80.
+  # Only listener; nothing can reach port 80 (see ALB SG ingress above).
   ALBHttpsListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -1251,8 +1261,12 @@ Resources:
                   - s3:GetBucketPublicAccessBlock
                   - s3:PutBucketTagging
                   - s3:GetBucketTagging
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:GetObject
                 Resource:
                   - arn:aws:s3:::three-tier-app-network-*
+                  - arn:aws:s3:::three-tier-app-network-*/*
               - Sid: Route53ScopedToCustomDomainZone
                 Effect: Allow
                 Action:
@@ -1495,6 +1509,10 @@ Outputs:
   CloudWatchDashboardURL:
     Description: CloudWatch dashboard URL
     Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${CloudWatchDashboard}
+
+  CfnArtifactsBucketName:
+    Description: S3 bucket deploy.yml uploads the template to
+    Value: !Ref CfnArtifactsBucket
 
   ALBLogsBucketName:
     Description: S3 bucket receiving ALB access logs
