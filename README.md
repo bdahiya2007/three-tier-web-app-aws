@@ -141,6 +141,7 @@ Adding the RDS read replica was followed by a dedicated security/architecture re
 - The replica's `read_only` enforcement acts as a fail-safe independent of HyperDB's own config: even a HyperDB misconfiguration couldn't cause a silent write to the replica; it would error loudly instead
 
 **Found and fixed**:
+- The ALB accepted traffic from *any* CloudFront distribution, because the origin-facing prefix list covers all of CloudFront. So someone else's distribution could reach WordPress without this stack's WAF. CloudFront now sends a secret `X-Origin-Verify` header (from Secrets Manager), and the ALB returns 403 without it. It was rolled out in two deploys (send first, enforce second), using two ordered listener rules instead of a default-action flip that would have briefly 403'd the whole site.
 - The WAF had no rate limiting, no WordPress/PHP rules and no logging, and its REST-API XSS exemption matched `/wp-json/wp/v2/` *anywhere* in the path. Added a per-IP rate limit on `wp-login.php`/`xmlrpc.php`, three more managed rule groups (in Count mode first), logging with cookie/authorization headers redacted, and two exact path prefixes for the exemption. A single prefix would have broken every editor save, because this install's REST API lives under `/index.php/wp-json/`. RDS deletion protection is now on for both instances.
 - `DBPassword`'s `AllowedPattern` didn't exclude `'` or `\`, which could break `db-config.php`'s PHP string literal and take the site down on a future password rotation — see the table above.
 - The DB master password was leaking into CloudWatch Logs: `UserData` runs under `bash -x`, which echoed the `sed` line writing the password into `wp-config.php` into `cloud-init-output.log` — a log group the CloudWatch agent ships off-instance. Confirmed on the live stack by counting matching log events (without printing them), fixed by disabling tracing around the credential lines. The fix only stops new leaks — already-written log events and the password itself must be treated as exposed (delete the old streams, rotate the password) — see [Deployment.md](Deployment.md#the-db-password-used-to-leak-into-the-cloud-init-log).
@@ -150,7 +151,7 @@ Adding the RDS read replica was followed by a dedicated security/architecture re
 - Neither RDS instance is encrypted at rest. This predates the replica, but a replica must match its source's encryption status, so the gap is now on two instances instead of one. Remediation requires snapshot → restore-as-encrypted for the primary (a new endpoint, genuinely disruptive) before the replica could be recreated encrypted too.
 - No TLS enforcement in transit between WordPress and RDS (`require_secure_transport` unset). Partially mitigated by VPC-level network isolation, but doesn't meet defense-in-depth for data-in-transit on its own.
 - The DB password moved to Secrets Manager (no longer in `UserData`, config files or the launch template), but it hasn't been rotated yet since the leak. That's the next step, and instances pick it up within a minute.
-- Redis has no encryption or AUTH token; the ALB still accepts traffic from *any* CloudFront distribution (a WAF bypass path). CloudFront now sends a secret origin header, and enforcing it on the ALB is the next step; RDS has no Multi-AZ; WordPress uses the DB master user. The newer WAF rule groups (WordPress, PHP, known-bad-inputs) run in Count mode until their logs are reviewed for false positives.
+- Redis has no encryption or AUTH token; RDS has no Multi-AZ; WordPress uses the DB master user. The newer WAF rule groups (WordPress, PHP, known-bad-inputs) run in Count mode until their logs are reviewed for false positives.
 - Accepted rather than planned: web servers in public subnets (a NAT Gateway would roughly double the running cost).
 
 The complete list, with verification commands and planned fixes, is in [Deployment.md](Deployment.md#known-security-gaps-not-yet-remediated--flagged-for-a-decision-not-overlooked).
@@ -201,9 +202,11 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides GitHubRepo=<your-repo-name> GitHubRepoId=<your-repo-id>
 
-# 2. Then the app stack
+# 2. Then the app stack (over the 51,200-byte inline limit, so --s3-bucket is required;
+#    on a first deploy use any bucket you own - CI later uses the stack's own bucket)
 aws cloudformation deploy \
   --template-file cloudformation/vpc.yaml \
+  --s3-bucket <an-existing-bucket-you-own> \
   --stack-name three-tier-app-network \
   --region us-east-1 \
   --capabilities CAPABILITY_NAMED_IAM \
