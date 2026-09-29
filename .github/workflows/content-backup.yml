@@ -1,0 +1,71 @@
+name: Back up blog content
+
+# Exports the blog's published content (posts, pages, media, categories/tags,
+# site-editor customizations, safe settings) into content/wordpress/ via
+# scripts/wp_content.py, and opens/updates a PR when anything changed. Restore
+# with the same script - see Deployment.md "Blog content backup and restore".
+#
+# Setup (one-time): a GitHub Environment named content-backup, restricted to
+# main, holding
+#   secret   WP_APP_PASSWORD - a WordPress Application Password (read access is
+#                              all it's used for; revoke it in WordPress anytime)
+#   variable WP_URL          - e.g. https://blog.securecloudengineers.com
+#   variable WP_USER         - the WordPress username that owns the password
+# plus "Allow GitHub Actions to create and approve pull requests" enabled.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: content-backup
+  cancel-in-progress: false
+
+jobs:
+  export:
+    name: Export blog content
+    runs-on: ubuntu-latest
+    environment: content-backup
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write # to dispatch validate.yml for the PR (see below)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Export content
+        env:
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+          WP_URL: ${{ vars.WP_URL }}
+          WP_USER: ${{ vars.WP_USER }}
+        run: python3 scripts/wp_content.py export --url "$WP_URL" --user "$WP_USER" --out content
+
+      # One long-lived branch/PR: a backlog of unmerged weekly backups updates
+      # the same PR instead of piling up new ones.
+      - name: Open or update the backup PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: content-backup/auto
+        run: |
+          if [ -z "$(git status --porcelain content)" ]; then
+            echo "No content changes."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add content
+          git commit -m "Back up blog content ($(date -u +%F))"
+          git push --force origin "$BRANCH"
+          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr create --base main --head "$BRANCH" \
+              --title "Blog content backup" \
+              --body "Automated export of published blog content by \`content-backup.yml\`. Review the diff and merge to keep \`content/\` current. Content-only merges don't trigger the AWS deploy (\`paths-ignore\` in \`deploy.yml\`)."
+          fi
+          # PRs and pushes made with GITHUB_TOKEN don't trigger pull_request
+          # workflows, so the required validate check would never report.
+          # workflow_dispatch is the exception - run it on the branch head.
+          gh workflow run validate.yml --ref "$BRANCH"

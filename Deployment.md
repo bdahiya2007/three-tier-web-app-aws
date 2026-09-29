@@ -947,6 +947,49 @@ php -r "\$r = new Redis(); \$r->connect('<redis-endpoint>', 6379); \$r->flushDb(
 
 Safe to run any time — the object cache is entirely disposable and gets rebuilt from the database on the next read. Verified: after flushing, `/wp-admin` redirected to the correct, newly-updated domain immediately, with no other change needed.
 
+## Blog content backup and restore
+
+The AWS backups (daily RDS and EFS recovery points in AWS Backup, a final snapshot on stack deletion, and deletion protection) cover losing the database **inside this AWS account**. They don't help if the account itself goes away (for example, the Free plan's credits run out) or if the blog moves to another host. For that, the blog's published content is also kept in this repo, under [`content/wordpress/`](content/), by [`scripts/wp_content.py`](scripts/wp_content.py).
+
+**What's captured:** published posts and pages (raw block-editor markup, so they restore as real blocks, not one big HTML blob), media files with their alt text and captions, categories (with nesting) and tags, reusable blocks, navigation menus, site-editor customizations (edited templates and template parts such as the footer, and global styles), and reading/general settings. **What isn't, on purpose:** users, emails, comments, drafts, WordPress's secret keys, or any database dump. This repo is public, so only what's already public on the blog goes in. For a full-fidelity restore inside AWS, use an RDS snapshot instead (see "Restore from a snapshot").
+
+### How the backup runs
+
+`content-backup.yml` runs every Monday at 06:00 UTC, or on demand (`gh workflow run content-backup.yml`). It exports through the REST API, authenticated with a WordPress **Application Password**. If anything changed, it force-pushes the branch `content-backup/auto` and opens a PR, or updates the one that's already open. Review and merge it like any other PR. Content-only merges **don't** trigger the AWS deploy (`paths-ignore: content/**` in `deploy.yml`).
+
+`content-tools-test.yml` proves the script works on every PR that touches it. It builds two throwaway WordPress sites in Docker on the runner, fills one with representative content (nested categories, a tag, an image used inline and as the featured image, a child page, a customized footer), exports it, restores into the other **twice** (re-running must update, not duplicate), re-exports, and compares the two.
+
+### One-time setup
+
+1. **Create the Application Password:** in WordPress, go to **Users → Profile → Application Passwords**, name it `github-content-backup`, and copy the generated password. It's shown once. It needs an administrator account, because templates, global styles and settings require `edit_theme_options`/`manage_options`. You can revoke it any time on the same screen.
+2. **Create the GitHub Environment, secret and variables.** Restricting the environment to `main` keeps the password away from any other branch's workflow runs:
+   ```bash
+   REPO=bdahiya2007/three-tier-web-app-aws
+   gh api -X PUT repos/$REPO/environments/content-backup --input - <<'EOF'
+   {"deployment_branch_policy": {"protected_branches": true, "custom_branch_policies": false}}
+   EOF
+   gh secret set WP_APP_PASSWORD --env content-backup          # paste the application password when prompted
+   gh variable set WP_URL  --env content-backup --body https://blog.securecloudengineers.com
+   gh variable set WP_USER --env content-backup --body <your-wordpress-username>
+   ```
+3. **Allow Actions to open PRs:**
+   ```bash
+   gh api -X PUT repos/$REPO/actions/permissions/workflow -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true
+   ```
+4. **Run it once:** `gh workflow run content-backup.yml`, then merge the PR it opens.
+
+### Disaster recovery: rebuild the blog from the repo
+
+1. Stand up WordPress anywhere: this stack (see "Deploy the stack"), another account, or another host. Finish the setup wizard, **activate the same theme** (`content/wordpress/theme.json`), and create an Application Password there.
+2. Preview, then restore:
+   ```bash
+   export WP_APP_PASSWORD='<new site app password>'   # never pass it as a CLI argument
+   python3 scripts/wp_content.py restore --url https://<new-site> --user <admin> --src content --dry-run
+   python3 scripts/wp_content.py restore --url https://<new-site> --user <admin> --src content
+   ```
+   Media is re-uploaded, and image blocks, featured images and page parents are remapped to the new site's IDs. Links and image URLs pointing at the old domain are rewritten to the new one. Posts keep their slugs and original dates. It's safe to re-run: existing items are matched by slug and updated.
+3. If the site's address changed, update DNS or `CustomDomainName` as usual. Also check **Settings → Permalinks**: plain permalinks work out of the box on this stack, and the restore works with either style.
+
 ## AWS Backup
 
 `BackupVault` is a dedicated vault; `BackupPlan` runs one rule (`Daily`) on a cron schedule (`BackupScheduleExpression`, default `cron(0 5 * * ? *)` — 05:00 UTC daily) with a 30-day retention (`BackupRetentionDays`) before AWS Backup deletes each recovery point. `BackupServiceRole` is the service role AWS Backup assumes to actually create backups, using the AWS-managed `AWSBackupServiceRolePolicyForBackup` policy.
@@ -1017,6 +1060,24 @@ grep -n "DB_PASSWORD\|db-secret" /var/www/html/wp-config.php   # only the requir
 **Cost:** $0.40/month per secret (two: this one and `three-tier-app-origin-verify`), plus $0.05 per 10,000 API calls. The 1-minute timer on 2–3 instances makes about 130k calls a month, roughly $0.65/month.
 
 ## Troubleshooting
+
+### WordPress REST API ignores an Application Password ("not allowed to edit posts in this post type")
+
+- **Symptom**: an authenticated request (`curl -u user:app-password ...?context=edit`) comes back as if anonymous: `rest_forbidden_context`. Even a deliberately wrong username gets the same answer instead of `invalid_username`, which proves WordPress never saw the header at all.
+- **Cause, two layers**: (1) **Apache**: `mod_proxy_fcgi` doesn't pass `Authorization` to PHP-FPM unless told to. WordPress's own `.htaccess` normally adds a rewrite for this, but plain permalinks have no `.htaccess`. (2) **CloudFront** strips `Authorization` from GET/HEAD requests unless it's part of the cache key. The first probe here went through as a POST (`?_method=GET`, which WordPress treats as a read) and was *still* ignored, which pinned the problem on Apache.
+- **Fix**: `UserData` writes `/etc/httpd/conf.d/wordpress-auth.conf` with `CGIPassAuth On` for `/var/www/html`. For the CloudFront layer, `scripts/wp_content.py` sends every authenticated read as `POST ...?_method=GET`, so no CloudFront or cache-policy change was needed. (Adding `Authorization` to a cache policy would have meant turning CloudFront caching back on.)
+- **Probe without real credentials**:
+  ```bash
+  curl -s -X POST -u "nosuchuser:xxxx xxxx xxxx xxxx xxxx xxxx" \
+    "https://<domain>/index.php/wp-json/wp/v2/posts?context=edit&_method=GET" | python3 -m json.tool | grep code
+  # "invalid_username" = the header reaches WordPress; "rest_forbidden_context" = it's being stripped
+  ```
+
+### A PR opened by a workflow never gets its required `validate` check
+
+- **Symptom**: the content-backup PR sits `BLOCKED`, "Expected — Waiting for status to be reported".
+- **Cause**: events created with the workflow's `GITHUB_TOKEN` (pushes, PR opens) deliberately don't trigger other workflows, which prevents recursive runs. So `validate.yml`'s `pull_request` trigger never fires for that PR.
+- **Fix**: `validate.yml` also accepts `workflow_dispatch`, which *is* allowed from `GITHUB_TOKEN`. `content-backup.yml` runs `gh workflow run validate.yml --ref content-backup/auto` after pushing. Required status checks are matched by check name on the head commit, not by the event that produced them, so the dispatched run satisfies branch protection.
 
 Every issue actually hit while building and operating this stack, with symptom → cause → fix. Check here first before re-diagnosing from scratch.
 
