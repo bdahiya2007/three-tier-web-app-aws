@@ -1469,6 +1469,8 @@ The `deploy` job in `deploy.yml` targets a GitHub Environment named `production`
 
 ## Delete the stack
 
+**To save cost and rebuild later, use `scripts/stack.sh down` / `up` instead** (see "Tear down and rebuild (cost saving)" at the end of this file). The steps below are the manual, permanent version. On their own, they'd also fail on the non-empty S3 buckets and AWS Backup vault, which the script empties first.
+
 Both RDS instances have **`DeletionProtection: true`**, so a plain `delete-stack` fails on them. Turn it off first. It's a deliberate extra step, the same guard that stops an accidental `delete-stack` from removing the database:
 
 ```bash
@@ -1495,3 +1497,53 @@ aws cloudformation delete-stack \
 ```
 
 The RDS instance has `DeletionPolicy: Snapshot`, so deleting the stack takes a final snapshot instead of destroying the database outright.
+
+## Tear down and rebuild (cost saving)
+
+The full stack costs about **$3.10–3.30 a day** (≈ $95–100/month), paid from Free plan credits at the time of writing. Most of that is instance-hours that stop the moment the stack is gone. [`scripts/stack.sh`](scripts/stack.sh) deletes the app stack with one command and rebuilds it with another, keeping the database. **While it's down, the cost is roughly the final DB snapshot's storage (cents a month).**
+
+```bash
+scripts/stack.sh status                 # what exists, what's billable, which snapshot 'up' would use
+scripts/stack.sh down                   # delete (asks you to type the stack name); ~25-40 min
+scripts/stack.sh up --ssh-key ~/.ssh/<your-key>.pem   # rebuild from the final snapshot; ~35-50 min
+```
+
+Both `down` and `up` accept `--dry-run`, which prints every step and each command it would run, using read-only calls only. Run it first to see exactly what will happen. `down --yes` skips the confirmation prompt.
+
+### What's kept and what's lost
+
+| Kept | Lost with the stack |
+|---|---|
+| **The database**: the final RDS snapshot (`DeletionPolicy: Snapshot`), with posts, pages, users, 2FA settings and site settings | **AWS Backup recovery points** (the daily RDS/EFS/EC2 backups). The vault must be empty before CloudFormation can delete it |
+| The **pipeline stack** (deploy role, Backup role, permissions boundary). It's IAM-only and free, and `up` needs it | **EFS** (`wp-content`): media uploads, plus any plugin installed through wp-admin rather than `UserData`. Two Factor, HyperDB and Redis Object Cache are installed by `UserData`, so they come back. The blog currently has no uploads. If you add images, back up `content/` first, and see the note below |
+| **`content/`** in git (published posts, pages, media, site-editor customizations) | CloudWatch logs in stack-owned log groups, ALB access logs, WAF logs |
+| Your stack **parameters**, saved by `down` to `~/.three-tier-app/three-tier-app-network-params.json` (outside the repo, mode `600`, because it holds your SSH source IP) | The secrets: `up` generates fresh ones, and sets the restored DB's password to match |
+
+The site is **offline while the stack is down**. DNS records, the CloudFront distribution and the certificate are deleted and recreated. The GitHub secrets (`AWS_DEPLOY_ROLE_ARN`, `KEY_PAIR_NAME`) don't change, because the pipeline stack stays.
+
+### What `down` does, in order
+
+1. **Saves the parameters.** Stack parameters disappear with the stack. `DBUsername` is `NoEcho`, so it's read from RDS instead.
+2. **Turns off deletion protection** on both RDS instances.
+3. **Deletes the read replica directly**, without a snapshot. Read replicas can't take a final snapshot, and it's rebuilt from the primary anyway.
+4. **Empties both S3 buckets** (ALB logs and template uploads). CloudFormation refuses to delete non-empty buckets.
+5. **Deletes every AWS Backup recovery point** and waits until the vault is empty, since a non-empty vault blocks stack deletion.
+6. **Deletes the stack** and waits. CloudFront has to be disabled before it can be deleted, which alone takes about 15 minutes. If the first attempt fails, usually because the ALB wrote new access logs after step 4, it empties the buckets again and retries once.
+7. **Force-deletes the two secrets.** Otherwise Secrets Manager reserves their names for 30 days, and `up` would fail with "a secret with this name is already scheduled for deletion".
+8. **Verifies:** the stack is gone, no RDS, ALB, EC2, ElastiCache, EFS, Elastic IP or CloudFront resources from this stack remain, and it prints the final snapshot's ID.
+
+### What `up` does, in order
+
+1. Refuses to run if the app stack already exists or the pipeline stack is missing, and picks the newest final snapshot (or `--snapshot <id>`).
+2. Creates a small template-upload bucket (`three-tier-app-network-bootstrap-<account>`, inside the deploy role's existing S3 scope, objects expire after 7 days). The template is over the 51,200-byte inline limit, and the stack's own bucket doesn't exist yet. The bucket is kept for next time.
+3. Starts `aws cloudformation deploy` with the saved parameters plus `DBSnapshotIdentifier`, in the background.
+4. **Watches for the restored `DBInstance`, then immediately sets its password from the new `three-tier-app-db-master` secret.** RDS snapshots keep the *old* master password, while instances read the *new* secret. CloudFormation creates the read replica before the web servers (their `UserData` needs its endpoint), which leaves time to do this before WordPress needs the database. It retries while RDS is briefly busy creating the replica.
+5. Waits for the stack, then verifies: the site returns 200 and, **with `--ssh-key`, a real MySQL login to both primary and replica** from an instance. A page load alone isn't enough; see "Site loads fine, but logins and writes fail" in Troubleshooting.
+6. Then **log in to `/wp-admin` once**: a login is the first thing that writes to the database.
+
+### Things to know
+
+- **Keep `DBSnapshotIdentifier` as `up` set it.** CI deploys reuse previous parameter values, so this happens automatically. *Changing* it on an existing stack makes CloudFormation replace the database.
+- **Don't approve a CI deploy while the stack is down.** `deploy.yml` fails at its first step anyway (the stack's bucket output doesn't exist), so it can't accidentally create a fresh, empty stack. Rebuild with `up`, not by merging.
+- **Uploads:** if the blog has images when you run `down`, they're gone from EFS after `up`, while the restored database still references them. `content/` has the files. Re-upload them from `content/wordpress/media/` through wp-admin (Media → Add New keeps the same filenames), or restore into an empty site with `wp_content.py restore`. An automated EFS backup/restore for uploads isn't built yet.
+- **What's not tested end to end yet:** `down` and `up` against the live stack. `status` and both `--dry-run` modes were run against it, and all resource lookups (DB IDs, buckets, the 10 recovery points, secrets) resolved correctly. The first real `down`/`up` should be done when an outage of about an hour is acceptable. Record anything that behaves differently here.
