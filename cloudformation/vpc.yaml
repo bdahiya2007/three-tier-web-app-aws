@@ -1106,6 +1106,15 @@ Resources:
               sed -i "/Add any custom values between this line/r /tmp/redis-config.php" /var/www/html/wp-config.php
               rm -f /tmp/redis-config.php
 
+              # Pass Authorization through to PHP-FPM (WordPress Application Passwords,
+              # used by scripts/wp_content.py). WordPress's .htaccess normally does
+              # this, but plain permalinks have no .htaccess.
+              cat > /etc/httpd/conf.d/wordpress-auth.conf <<'HTTPDEOF'
+              <Directory "/var/www/html">
+                  CGIPassAuth On
+              </Directory>
+              HTTPDEOF
+
               chown -R apache:apache /var/www/html
               chmod -R 755 /var/www/html
 

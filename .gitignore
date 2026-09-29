@@ -47,3 +47,14 @@ Thumbs.db
 
 # --- Local-only tracking files ---
 TODO.md
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- scripts/wp_content.py working output (only content/wordpress/ is committed) ---
+content/wordpress.tmp/
+out-source/
+out-target/

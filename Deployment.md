@@ -880,7 +880,8 @@ Found during security architect reviews (the first for this feature; a second, s
 - **Redis has no encryption in transit, at rest, or AUTH token** (`describe-cache-clusters`: `TransitEncryptionEnabled`/`AtRestEncryptionEnabled`/`AuthTokenEnabled` all `false`). Only `RedisSecurityGroup` protects it. **Planned:** an encrypted `ReplicationGroup` with TLS and an AUTH token. At-rest encryption can't be enabled on a `CacheCluster`.
 - **No Multi-AZ** on the RDS primary (roughly doubles RDS cost). Deletion protection is now on for both instances.
 - **WordPress connects as the RDS master user**, not a least-privilege application user.
-- **Smaller hardening items:** no explicit `MetadataOptions` (IMDSv2 is enforced today only by the AL2023 AMI default), plain HTTP on the in-VPC ALB→instance hop, unpinned WordPress/plugin downloads with no checksum, `chmod -R 755` leaving config files world-readable, no CloudFront security-headers policy, no `aws:SecureTransport` deny on the ALB logs bucket, GitHub Actions pinned by tag rather than SHA.
+- **Three WAF managed rule groups are still in Count mode** (`KnownBadInputs`, `WordPress`, `PHP`): they log matches but don't block yet. They switch to Block once the WAF logs show no false positives on real traffic (see "WAF logs and promoting Count rules to Block").
+- **Smaller hardening items:** no explicit `MetadataOptions` (IMDSv2 is enforced today only by the AL2023 AMI default), plain HTTP on the in-VPC ALB→instance hop, unpinned WordPress/plugin downloads with no checksum, `chmod -R 755` on the web root (lower impact since the DB password moved out of `wp-config.php`/`db-config.php` into `/etc/wordpress/db-secret.php`, mode `640`), no CloudFront security-headers policy, no `aws:SecureTransport` deny on the ALB logs bucket, GitHub Actions pinned by tag rather than SHA.
 - **Accepted, not planned:** web servers in public subnets. Moving them to private subnets needs a NAT Gateway (~$33/month + $0.045/GB), which would roughly double the running cost; the security groups already limit HTTP to the ALB and SSH to one IP.
 
 ### Known limitation: replication lag
@@ -946,6 +947,10 @@ php -r "\$r = new Redis(); \$r->connect('<redis-endpoint>', 6379); \$r->flushDb(
 ```
 
 Safe to run any time — the object cache is entirely disposable and gets rebuilt from the database on the next read. Verified: after flushing, `/wp-admin` redirected to the correct, newly-updated domain immediately, with no other change needed.
+
+## Blog content backup and restore
+
+The blog's published content is backed up to this repo weekly and can be restored onto any WordPress site. Setup, what's captured and the disaster-recovery runbook are in [`content/README.md`](content/README.md).
 
 ## AWS Backup
 
@@ -1017,6 +1022,24 @@ grep -n "DB_PASSWORD\|db-secret" /var/www/html/wp-config.php   # only the requir
 **Cost:** $0.40/month per secret (two: this one and `three-tier-app-origin-verify`), plus $0.05 per 10,000 API calls. The 1-minute timer on 2–3 instances makes about 130k calls a month, roughly $0.65/month.
 
 ## Troubleshooting
+
+### WordPress REST API ignores an Application Password ("not allowed to edit posts in this post type")
+
+- **Symptom**: an authenticated request (`curl -u user:app-password ...?context=edit`) comes back as if anonymous: `rest_forbidden_context`. Even a deliberately wrong username gets the same answer instead of `invalid_username`, which proves WordPress never saw the header at all.
+- **Cause, two layers**: (1) **Apache**: `mod_proxy_fcgi` doesn't pass `Authorization` to PHP-FPM unless told to. WordPress's own `.htaccess` normally adds a rewrite for this, but plain permalinks have no `.htaccess`. (2) **CloudFront** strips `Authorization` from GET/HEAD requests unless it's part of the cache key. The first probe here went through as a POST (`?_method=GET`, which WordPress treats as a read) and was *still* ignored, which pinned the problem on Apache.
+- **Fix**: `UserData` writes `/etc/httpd/conf.d/wordpress-auth.conf` with `CGIPassAuth On` for `/var/www/html`. For the CloudFront layer, `scripts/wp_content.py` sends every authenticated read as `POST ...?_method=GET`, so no CloudFront or cache-policy change was needed. (Adding `Authorization` to a cache policy would have meant turning CloudFront caching back on.)
+- **Probe without real credentials**:
+  ```bash
+  curl -s -X POST -u "nosuchuser:xxxx xxxx xxxx xxxx xxxx xxxx" \
+    "https://<domain>/index.php/wp-json/wp/v2/posts?context=edit&_method=GET" | python3 -m json.tool | grep code
+  # "invalid_username" = the header reaches WordPress; "rest_forbidden_context" = it's being stripped
+  ```
+
+### A PR opened by a workflow never gets its required `validate` check
+
+- **Symptom**: the content-backup PR sits `BLOCKED`, "Expected — Waiting for status to be reported".
+- **Cause**: events created with the workflow's `GITHUB_TOKEN` (pushes, PR opens) deliberately don't trigger other workflows, which prevents recursive runs. So `validate.yml`'s `pull_request` trigger never fires for that PR.
+- **Fix**: `validate.yml` also accepts `workflow_dispatch`, which *is* allowed from `GITHUB_TOKEN`. `content-backup.yml` runs `gh workflow run validate.yml --ref content-backup/auto` after pushing. Required status checks are matched by check name on the head commit, not by the event that produced them, so the dispatched run satisfies branch protection.
 
 Every issue actually hit while building and operating this stack, with symptom → cause → fix. Check here first before re-diagnosing from scratch.
 

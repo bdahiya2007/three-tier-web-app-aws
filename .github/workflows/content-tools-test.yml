@@ -1,0 +1,143 @@
+name: Content tools round-trip test
+
+# Proves scripts/wp_content.py actually works, on real WordPress: builds two
+# throwaway sites in Docker, fills the source with representative content
+# (nested categories, tags, an image used inline and as featured image, a
+# child page, a customized footer template part), exports it, restores into
+# the empty target twice (idempotency), re-exports the target and compares.
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - scripts/wp_content.py
+      - .github/workflows/content-tools-test.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  roundtrip:
+    name: Export/restore round trip
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Start MySQL and two WordPress sites
+        run: |
+          docker network create wp
+          docker run -d --name db --network wp -e MYSQL_ROOT_PASSWORD=root mysql:8.4
+          until docker exec db mysql -uroot -proot -e 'SELECT 1' >/dev/null 2>&1; do sleep 2; done
+          docker exec db mysql -uroot -proot -e 'CREATE DATABASE source; CREATE DATABASE target;'
+          for site in source:8081 target:8082; do
+            name=${site%%:*}; port=${site##*:}
+            docker run -d --name $name --network wp -p $port:80 \
+              -e WORDPRESS_DB_HOST=db -e WORDPRESS_DB_USER=root -e WORDPRESS_DB_PASSWORD=root \
+              -e WORDPRESS_DB_NAME=$name \
+              -e WORDPRESS_CONFIG_EXTRA="define('WP_ENVIRONMENT_TYPE', 'local');" \
+              wordpress:php8.3-apache
+          done
+          for name in source target; do
+            until docker exec $name test -f /var/www/html/wp-config.php; do sleep 2; done
+          done
+
+      - name: Install WordPress and create application passwords
+        run: |
+          wpcli() { site=$1; shift; docker run --rm --network wp --volumes-from $site --user 33:33 \
+            -e WORDPRESS_DB_HOST=db -e WORDPRESS_DB_USER=root -e WORDPRESS_DB_PASSWORD=root \
+            -e WORDPRESS_DB_NAME=$site wordpress:cli-php8.3 wp "$@"; }
+          wpcli source core install --url=http://localhost:8081 --title="Source Blog" \
+            --admin_user=admin --admin_password=admin --admin_email=admin@example.com --skip-email
+          wpcli target core install --url=http://localhost:8082 --title="Target" \
+            --admin_user=admin --admin_password=admin --admin_email=admin@example.com --skip-email
+          # Source mirrors the live site's /index.php/ permalinks; target stays
+          # plain (?rest_route=), so both REST root styles get exercised.
+          wpcli source rewrite structure '/index.php/%postname%/'
+          # Throwaway localhost sites, but mask the passwords in logs anyway.
+          src=$(wpcli source user application-password create admin ci --porcelain)
+          dst=$(wpcli target user application-password create admin ci --porcelain)
+          echo "::add-mask::$src"; echo "::add-mask::$dst"
+          echo "SRC_PW=$src" >> "$GITHUB_ENV"; echo "DST_PW=$dst" >> "$GITHUB_ENV"
+
+      - name: Create representative content on the source site
+        run: |
+          wpcli() { site=$1; shift; docker run --rm --network wp --volumes-from $site --user 33:33 \
+            -e WORDPRESS_DB_HOST=db -e WORDPRESS_DB_USER=root -e WORDPRESS_DB_PASSWORD=root \
+            -e WORDPRESS_DB_NAME=$site wordpress:cli-php8.3 wp "$@"; }
+          python3 -c "
+          import zlib,struct
+          def chunk(t,d): return struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff)
+          raw=b''.join(b'\x00'+b'\x20\x60\xa0'*400 for _ in range(300))
+          open('diagram.png','wb').write(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',400,300,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(raw))+chunk(b'IEND',b''))"
+          docker cp diagram.png source:/var/www/html/diagram.png
+          docker exec source chown 33:33 /var/www/html/diagram.png
+          media=$(wpcli source media import /var/www/html/diagram.png --title="Architecture diagram" --alt="Three-tier diagram" --porcelain)
+          url=$(wpcli source post get $media --field=guid)
+          parent=$(wpcli source term create category "Cloud" --slug=cloud --porcelain)
+          child=$(wpcli source term create category "AWS" --slug=aws --parent=$parent --porcelain)
+          content="<!-- wp:paragraph --><p>Intro with a <a href=\"http://localhost:8081/index.php/about/\">link</a>.</p><!-- /wp:paragraph -->
+          <!-- wp:image {\"id\":$media,\"sizeSlug\":\"full\"} --><figure class=\"wp-block-image size-full\"><img src=\"$url\" alt=\"Three-tier diagram\" class=\"wp-image-$media\"/></figure><!-- /wp:image -->"
+          post=$(wpcli source post create --post_title="How I Built It" --post_name=how-i-built-it \
+            --post_content="$content" --post_status=publish --post_category=$child --tags_input=security --porcelain)
+          wpcli source post meta set $post _thumbnail_id $media
+          about=$(wpcli source post create --post_type=page --post_title=About --post_name=about \
+            --post_content='<!-- wp:paragraph --><p>About me</p><!-- /wp:paragraph -->' --post_status=publish --porcelain)
+          wpcli source post create --post_type=page --post_title=Contact --post_name=contact --post_parent=$about \
+            --post_content='<!-- wp:paragraph --><p>Contact</p><!-- /wp:paragraph -->' --post_status=publish
+          theme=$(wpcli source theme list --status=active --field=name)
+          curl -sf -u "admin:$SRC_PW" -X POST -H 'Content-Type: application/json' \
+            "http://localhost:8081/index.php/wp-json/wp/v2/template-parts/$theme//footer" \
+            -d '{"content":"<!-- wp:paragraph --><p>Custom footer from the source site</p><!-- /wp:paragraph -->"}' >/dev/null
+
+      - name: Export source, restore into target (twice), re-export target
+        run: |
+          WP_APP_PASSWORD="$SRC_PW" python3 scripts/wp_content.py export --url http://localhost:8081 --user admin --out out-source
+          WP_APP_PASSWORD="$DST_PW" python3 scripts/wp_content.py restore --url http://localhost:8082 --user admin --src out-source --dry-run
+          WP_APP_PASSWORD="$DST_PW" python3 scripts/wp_content.py restore --url http://localhost:8082 --user admin --src out-source
+          WP_APP_PASSWORD="$DST_PW" python3 scripts/wp_content.py restore --url http://localhost:8082 --user admin --src out-source
+          WP_APP_PASSWORD="$DST_PW" python3 scripts/wp_content.py export --url http://localhost:8082 --user admin --out out-target
+
+      - name: Compare source and restored target
+        run: |
+          python3 - <<'EOF'
+          import json, pathlib, re, sys
+          src, dst = pathlib.Path("out-source/wordpress"), pathlib.Path("out-target/wordpress")
+          fails = []
+          def norm(t):
+              t = re.sub(r"http://localhost:808[12]", "SITE", t)
+              t = re.sub(r"/uploads/\d{4}/\d{2}/", "/uploads/Y/M/", t)
+              t = re.sub(r"wp-image-\d+", "wp-image-N", t)
+              return re.sub(r'"(id|mediaId)":\d+', r'"\1":N', t)
+          def check(cond, msg):
+              print(("ok   " if cond else "FAIL ") + msg); cond or fails.append(msg)
+          for kind in ("posts", "pages", "template-parts"):
+              a = sorted(p.name for p in (src / kind).glob("*")); b = sorted(p.name for p in (dst / kind).glob("*"))
+              check(a == b and a, f"{kind}: same slugs {a}")
+              for slug in a:
+                  sa, sb = (src/kind/slug/"content.html").read_text(), (dst/kind/slug/"content.html").read_text()
+                  check(norm(sa) == norm(sb), f"{kind}/{slug}: content identical after id/url normalization")
+                  ma, mb = json.loads((src/kind/slug/"meta.json").read_text()), json.loads((dst/kind/slug/"meta.json").read_text())
+                  check(ma.get("title") == mb.get("title"), f"{kind}/{slug}: title")
+          def terms(d, k):
+              ts = json.loads((d / f"{k}.json").read_text()); by = {t["id"]: t["slug"] for t in ts}
+              return sorted((t["slug"], t["name"], by.get(t.get("parent"))) for t in ts)
+          for k in ("categories", "tags"):
+              check(terms(src, k) == terms(dst, k), f"{k}: same names/slugs/parents")
+          ma, mb = json.loads((src/"media.json").read_text()), json.loads((dst/"media.json").read_text())
+          check(len(ma) == len(mb) == 1, "media: exactly one item (restore twice didn't duplicate)")
+          check((src/"media"/ma[0]["file"]).read_bytes() == (dst/"media"/mb[0]["file"]).read_bytes(), "media: identical bytes")
+          check(ma[0]["alt_text"] == mb[0]["alt_text"], "media: alt text")
+          post = json.loads((dst/"posts/how-i-built-it/meta.json").read_text())
+          check(post["featured_media"] == mb[0]["id"], "post: featured image remapped to the new media id")
+          body = (dst/"posts/how-i-built-it/content.html").read_text()
+          check(f'wp-image-{mb[0]["id"]}' in body and "localhost:8081" not in body, "post: image block + links point at the target")
+          child = json.loads((dst/"pages/contact/meta.json").read_text())
+          about = json.loads((dst/"pages/about/meta.json").read_text())
+          check(child["parent"] == about["id"], "pages: child page parent remapped")
+          check(json.loads((dst/"settings.json").read_text())["title"] == "Source Blog", "settings: site title")
+          sys.exit(1 if fails else 0)
+          EOF

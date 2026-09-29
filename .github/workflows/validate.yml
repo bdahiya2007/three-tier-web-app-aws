@@ -18,9 +18,12 @@ on:
   pull_request:
     branches:
       - main
+  # content-backup.yml dispatches this on its PR branch: PRs opened with
+  # GITHUB_TOKEN don't fire pull_request, so the required check would never report.
+  workflow_dispatch:
 
 concurrency:
-  group: cfn-lint-${{ github.event.pull_request.number }}
+  group: cfn-lint-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
