@@ -13,6 +13,27 @@
 
 Only **published** content is exported — no users, emails, comments, drafts or database dump — because this repository is public.
 
+## Everyday use: publish a post, then back it up
+
+1. **Write and publish** in WordPress as usual: https://blog.securecloudengineers.com/wp-admin/ → Posts → Add New → **Publish**. Only *published* posts and pages are backed up; drafts, scheduled and private posts are skipped.
+2. **Back it up.** Either wait for the automatic Monday 06:00 UTC run, or back it up right away:
+   ```bash
+   gh workflow run content-backup.yml
+   gh run watch "$(gh run list --workflow content-backup.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+   ```
+   If nothing changed since the last backup, the run finishes with "No content changes." and doesn't open a PR.
+3. **Review the PR** it opens (or updates), titled **"Blog content backup"**. The diff shows exactly what changed: a new `posts/<slug>/` folder for a new post, edited lines in `content.html` for an edit, and new files under `media/` for uploaded images.
+4. **Approve the check and merge:** on the PR, click **"Approve workflows to run"**, wait about 20 seconds for `validate` to pass, then **Merge**. No AWS deploy runs, because the PR only touches `content/`.
+
+**Editing or deleting later:** edits are picked up the same way. If you unpublish or delete a post in WordPress, the next backup removes its folder, and the PR diff shows that deletion. Review it before merging, because merging is what drops it from the repo. Git history still keeps every earlier version.
+
+**Check what's backed up:**
+```bash
+git pull
+ls content/wordpress/posts/                          # one folder per published post
+git log --oneline -- content/wordpress/ | head        # when each backup landed
+```
+
 ## Why this exists
 
 The AWS backups (daily RDS and EFS recovery points in AWS Backup, a final snapshot on stack deletion, and deletion protection) cover losing the database **inside this AWS account**. They don't help if the account itself goes away (for example, the Free plan's credits run out) or if the blog moves to another host. For that, the blog's published content is also kept in this repo, under [`content/wordpress/`](.), by [`scripts/wp_content.py`](../scripts/wp_content.py).
@@ -59,6 +80,14 @@ The AWS backups (daily RDS and EFS recovery points in AWS Backup, a final snapsh
 3. If the site's address changed, update DNS or `CustomDomainName` as usual. Also check **Settings → Permalinks**: plain permalinks work out of the box on this stack, and the restore works with either style.
 
 ## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Backup run fails with `HTTP 401` on `/wp/v2/users/me` | The Application Password was revoked, or `WP_USER` doesn't match its owner. Create a new one (setup step 1) and update the secret: `gh secret set WP_APP_PASSWORD --env content-backup`. |
+| Backup run fails with `HTTP 403` | The WordPress user lost its administrator role, or the WAF blocked the request. Check `aws-waf-logs-three-tier-app` for the runner's IP. |
+| Backup PR stays `BLOCKED` | Click **"Approve workflows to run"** on the PR (see setup, "Approving each backup PR's check"). |
+| Run says "No content changes." after you published | Check the post is **Published** and not Scheduled or Private. Only published content is exported. |
+| Can't log in to WordPress at all | Not a backup issue. See "Site loads fine, but logins and writes fail" in [Deployment.md](../Deployment.md). |
 
 Two infrastructure issues were hit getting this working. Both are written up in [Deployment.md](../Deployment.md)'s Troubleshooting section:
 - **"WordPress REST API ignores an Application Password"**: Apache and CloudFront were each dropping the `Authorization` header.
