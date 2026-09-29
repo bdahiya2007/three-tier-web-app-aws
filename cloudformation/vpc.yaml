@@ -510,6 +510,43 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref ALBTargetGroup
 
+  # Only requests carrying CloudFront's secret X-Origin-Verify header reach
+  # WordPress; any other CloudFront distribution pointed here gets a 403.
+  # Two rules rather than flipping the listener default: the default would
+  # change before this rule exists (it Refs the listener), 403ing everything.
+  ALBForwardWithOriginHeader:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBHttpsListener
+      Priority: 1
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Origin-Verify
+            Values:
+              - !Sub '{{resolve:secretsmanager:${OriginVerifySecret}}}'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  ALBRejectWithoutOriginHeader:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    DependsOn: ALBForwardWithOriginHeader
+    Properties:
+      ListenerArn: !Ref ALBHttpsListener
+      Priority: 2
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /*
+      Actions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '403'
+            ContentType: text/plain
+            MessageBody: Forbidden
+
   WAFWebACL:
     Type: AWS::WAFv2::WebACL
     Properties:

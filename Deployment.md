@@ -74,11 +74,12 @@ aws cloudformation deploy \
   --parameter-overrides GitHubRepo=<your-repo-name> GitHubRepoId=<your-repo-id>
 ```
 
-Then the app stack:
+Then the app stack. It's over CloudFormation's 51,200-byte inline template limit, so `--s3-bucket` is required. On a first deploy, the stack's own `CfnArtifactsBucket` doesn't exist yet, so pass any S3 bucket you own in the same region. After that, CI uses the stack's bucket automatically:
 
 ```bash
 aws cloudformation deploy \
   --template-file cloudformation/vpc.yaml \
+  --s3-bucket <an-existing-bucket-you-own> \
   --stack-name three-tier-app-network \
   --region us-east-1 \
   --capabilities CAPABILITY_NAMED_IAM \
@@ -565,6 +566,25 @@ This template creates its own dedicated `WAFWebACL`, scoped only to this project
 
 **Consequence**: the ALB's DNS name (`LoadBalancerDNSName` output) is no longer reachable from your laptop directly — only from CloudFront's edge network. Every `curl http://<alb-dns-name>` example used earlier in this file (and throughout this project's troubleshooting history) now only works from *inside* an EC2 instance in the VPC, not from an external machine, and only over HTTPS now (see below) — not HTTP at all. Use `WordPressURL` (the CloudFront domain) for anything from outside the VPC now.
 
+### Why the prefix list isn't enough: the ALB also checks a secret origin header
+
+**Found in the second security review:** the prefix list above admits *every* CloudFront distribution, not just this stack's. Anyone could create their own distribution with this ALB as its origin (rewriting `Host` at the edge so the TLS certificate check passes) and reach WordPress without going through this stack's WAF.
+
+**Fix (the standard AWS pattern):** CloudFront adds a secret header, and the ALB only forwards requests that carry it.
+- `OriginVerifySecret` (Secrets Manager, `three-tier-app-origin-verify`) holds a 48-character random value. CloudFront's origin sends it as `X-Origin-Verify` (`OriginCustomHeaders`, resolved with `{{resolve:secretsmanager:...}}` at deploy time).
+- The HTTPS listener has two rules. **Priority 1** (`ALBForwardWithOriginHeader`): header matches → forward to WordPress. **Priority 2** (`ALBRejectWithoutOriginHeader`, path `/*`): everything else → fixed `403 Forbidden`.
+- **Why two rules instead of just switching the listener's default action to 403:** a `ListenerRule` `Ref`s its listener, so CloudFormation always updates the listener *before* creating the rule. Flipping the default first would have returned 403 for the whole site until the forward rule existed. With two rules, `DependsOn` guarantees the forward rule exists before the catch-all 403 does. The listener's default action (forward) is still there but unreachable, because `/*` matches every path.
+- **Rolled out in two deploys:** first CloudFront started sending the header, with nothing enforcing it. Only after confirming (`aws cloudfront get-distribution-config`) that the header was being sent with the right value did the ALB start requiring it. Enforcing first would have rejected CloudFront's own traffic.
+- Scope: this uses no WAF capacity and adds no cost. The header only exists on the CloudFront→ALB hop (HTTPS), never in viewer traffic.
+
+**Verify** (the ALB isn't reachable from outside CloudFront, so check its config and the site):
+
+```bash
+aws elbv2 describe-rules --region us-east-1 --listener-arn <https-listener-arn> \
+  --query "Rules[].[Priority,Conditions[0].Field,Actions[0].Type,Actions[0].FixedResponseConfig.StatusCode]" --output table
+curl -s -o /dev/null -w "%{http_code}\n" https://<domain>/     # 200: CloudFront sends the header
+```
+
 ### CloudFront-to-ALB traffic is now HTTPS, not plain HTTP
 
 Previously, CloudFront terminated TLS for viewers but talked to the ALB over plain HTTP (`OriginProtocolPolicy: http-only`) — visitor traffic was encrypted end-to-end to CloudFront, but the CloudFront-to-origin hop inside AWS's network was not. Fixed by:
@@ -848,7 +868,6 @@ Found during security architect reviews (the first for this feature; a second, s
 - **No TLS enforcement in transit** between the web tier and either RDS instance (`require_secure_transport` unset, using the MySQL engine default). Check with `aws rds describe-db-parameters --db-parameter-group-name <group> --query "Parameters[?ParameterName=='require_secure_transport']"`. Partially mitigated by VPC-level network isolation (unreachable from outside the VPC regardless), but doesn't meet defense-in-depth for data-in-transit on its own. Lower-risk to remediate than the encryption gap — a parameter group change plus adding SSL context to the MySQL/HyperDB connections, no instance replacement needed.
 - **The DB master password hasn't been rotated yet.** It's now held in Secrets Manager and no longer in `UserData`, but it's still the value that leaked to CloudWatch Logs and that older launch template versions contain. **Planned:** generate a new random password in the secret and RDS; instances pick it up within a minute (see "DB password in Secrets Manager").
 - **Redis has no encryption in transit, at rest, or AUTH token** (`describe-cache-clusters`: `TransitEncryptionEnabled`/`AtRestEncryptionEnabled`/`AuthTokenEnabled` all `false`). Only `RedisSecurityGroup` protects it. **Planned:** an encrypted `ReplicationGroup` with TLS and an AUTH token. At-rest encryption can't be enabled on a `CacheCluster`.
-- **The ALB accepts any CloudFront distribution, not just this one.** The origin-facing prefix list covers all of CloudFront, so someone else's distribution pointed at the ALB could bypass this stack's WAF. **In progress:** CloudFront now sends a secret `X-Origin-Verify` header, stored in Secrets Manager as `three-tier-app-origin-verify`. The next step makes the ALB listener reject requests without it (fixed 403). That has to be a separate deploy, after CloudFront is already sending the header, or the site would go down.
 - **No Multi-AZ** on the RDS primary (roughly doubles RDS cost). Deletion protection is now on for both instances.
 - **WordPress connects as the RDS master user**, not a least-privilege application user.
 - **Smaller hardening items:** no explicit `MetadataOptions` (IMDSv2 is enforced today only by the AL2023 AMI default), plain HTTP on the in-VPC ALB→instance hop, unpinned WordPress/plugin downloads with no checksum, `chmod -R 755` leaving config files world-readable, no CloudFront security-headers policy, no `aws:SecureTransport` deny on the ALB logs bucket, GitHub Actions pinned by tag rather than SHA, and `DB_PASSWORD` interpolated straight into a `run:` shell line.
@@ -1080,6 +1099,13 @@ Every issue actually hit while building and operating this stack, with symptom �
 - **Hit again (PR #21)**: a 3-line `set +x` change took the template from 51,155 to 51,357 bytes. It passed `cfn-lint`, merged, and then failed on deploy. Trimmed the longest parameter/template descriptions (down to ~50,350 bytes). `validate.yml` now has a **"Check template size"** step that fails the PR if the template is over 51,200 bytes, so this is caught before merge instead of after.
 - **Permanent fix, step 1 of 2**: the stack now has a `CfnArtifactsBucket` (auto-named `three-tier-app-network-cfnartifactsbucket-*`, so it already falls inside `GitHubActionsDeployRole`'s S3 scope, which gained `s3:PutObject`/`GetObject`/`ListBucket`), with templates expiring after 7 days. This has to deploy through the old inline path first, since the role can't upload to a bucket that doesn't exist yet. Step 2 switches `deploy.yml` to `--s3-bucket` (limit becomes 1 MB).
 - **Permanent fix, step 2 of 2**: `deploy.yml` now uploads the template to `CfnArtifactsBucket` and validates/deploys it by URL (`validate-template --template-url`, `deploy --s3-bucket`). The limit is now **1 MB**, and `validate.yml`'s size check was raised to match. **Manual deploys** from your machine hit the same 51,200-byte limit once the template grows past it again. Add `--s3-bucket $(aws cloudformation describe-stacks --stack-name three-tier-app-network --query "Stacks[0].Outputs[?OutputKey=='CfnArtifactsBucketName'].OutputValue" --output text)` to any `aws cloudformation deploy` command in this file.
+- **Crossed for real at 51,745 bytes** (the listener rules that enforce the origin header). From here on, **every** manual `deploy` in this file needs `--s3-bucket`, and local validation needs `--template-url` too. `validate-template --template-body` fails with the same misleading "echoes the whole template" error:
+  ```bash
+  B=$(aws cloudformation describe-stacks --stack-name three-tier-app-network --region us-east-1 \
+    --query "Stacks[0].Outputs[?OutputKey=='CfnArtifactsBucketName'].OutputValue" --output text)
+  aws s3 cp --only-show-errors cloudformation/vpc.yaml s3://$B/validate/local.yaml
+  aws cloudformation validate-template --region us-east-1 --template-url https://$B.s3.amazonaws.com/validate/local.yaml
+  ```
 
 ### PR checks stop running / stuck `pending` forever
 
