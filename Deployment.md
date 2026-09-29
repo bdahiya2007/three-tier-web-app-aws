@@ -174,7 +174,22 @@ Any change that affects the launch template — `LatestAmiId`, `WebServerInstanc
 
 **`WebServerAutoScalingGroup` now has an `UpdatePolicy` (`AutoScalingRollingUpdate`, `MinInstancesInService: AsgMinSize`, `MaxBatchSize: 1`), so this rollout now happens automatically as part of the stack update itself** — the `aws cloudformation deploy`/`update-stack` call doesn't return `UPDATE_COMPLETE` until every instance has actually been replaced and passed its health check. No separate manual step needed for the common case anymore.
 
-**Tradeoff worth knowing**: this removes the manual pause that used to exist between "the stack update finished" and "running instances actually got the new config" — previously, a bad AMI/UserData change would sit harmlessly on the launch template until someone manually ran an instance refresh, giving a chance to catch it first. Now a bad change rolls out automatically on merge. The safety net that replaces the manual pause is CloudFormation's own rollback behavior: instances that fail their health check during the rolling update cause the *whole stack update* to fail and roll back (same as any other resource failure) — so a broken change won't succeed in replacing every instance silently, but it does mean the failure surfaces during the deploy itself rather than being caught before instances are ever touched.
+**Tradeoff worth knowing**: this removes the manual pause that used to exist between "the stack update finished" and "running instances actually got the new config". Previously, a bad AMI/UserData change would sit harmlessly on the launch template until someone ran an instance refresh. Now a bad change rolls out automatically on merge.
+
+**Correction, and what now makes that safe:** this section used to say that instances failing their health check would fail and roll back the stack update. **With only a `PauseTime`, that wasn't true.** CloudFormation just waited the fixed 10 minutes per instance and moved on, whatever state the instance was in. The rolling update now uses **resource signals**:
+- `WaitOnResourceSignals: true` on the `UpdatePolicy`, and a `CreationPolicy` for stack creation (including `scripts/stack.sh up`).
+- The last step of `UserData` is a readiness check: a real MySQL login to **both** primary and replica with the secret's password, then WordPress answering on localhost. Only then does the instance run `cfn-signal -e 0`. A page load alone wouldn't prove anything, because the Redis object cache can serve pages with a dead database.
+- The check retries for up to 10 minutes, since `stack.sh up` sets a restored DB's password while instances may already be booting.
+- An `ERR` trap sends `cfn-signal -e 1` **the moment any `UserData` step fails** (`bash -e`). CloudFormation then rolls back immediately instead of waiting out the timeout.
+- `PauseTime: PT20M` is now each instance's signal **timeout**, not a fixed wait. No signal in 20 minutes also means rollback.
+- `cfn-signal` needs no IAM permissions (CloudFormation checks that the caller is an instance of the stack), so the permissions boundary didn't need changing. It comes from the `aws-cfn-bootstrap` package, installed first in `UserData`.
+- Tested before shipping: the rendered readiness block ran under `bash -e` with stubbed `mysql`/`curl`/`cfn-signal`. A working DB → success signal. A DB failing all 20 attempts → failure signal and exit 1. A DB that starts working on attempt 5 → success.
+
+**Effect:** a rolling update now takes about **10–12 minutes** (each instance's real boot time, about 4–6 minutes) instead of about 23 (two fixed 10-minute pauses plus overhead), and a change that breaks database access rolls back instead of going live.
+
+**Debugging a rolled-back update:** stack events show `Received FAILURE signal with UniqueId i-...` or a signal timeout. That instance's `UserData` output is in CloudWatch Logs (`/<EnvironmentName>/cloud-init-output`, stream = instance ID). The readiness loop prints `not ready yet (attempt N/20)` lines. It deliberately doesn't say which check failed, to keep the password-handling block quiet. Run the direct-login diagnostic in Troubleshooting ("Site loads fine, but logins and writes fail") against a running instance to find out.
+
+**Outside a stack operation** (the ASG replacing an unhealthy instance on its own), the final `cfn-signal` is simply rejected, because nothing is waiting for it. `UserData` logs "cfn-signal not accepted – normal outside a stack create/update" and carries on.
 
 **Manual instance refresh is still available** for the case where you want to force new instances *without* any actual launch-template property change (e.g. to pick up new OS-level packages that landed inside the same AMI ID, or as a routine restart) — `UpdatePolicy` only triggers on a real diff to the launch template, so a genuinely no-op deploy won't roll anything automatically:
 
@@ -1505,7 +1520,7 @@ The full stack costs about **$3.10–3.30 a day** (≈ $95–100/month), paid fr
 ```bash
 scripts/stack.sh status                 # what exists, what's billable, which snapshot 'up' would use
 scripts/stack.sh down                   # delete (asks you to type the stack name); ~25-40 min
-scripts/stack.sh up --ssh-key ~/.ssh/<your-key>.pem   # rebuild from the final snapshot; ~35-50 min
+scripts/stack.sh up --ssh-key ~/.ssh/<your-key>.pem   # rebuild from the final snapshot; ~30-45 min
 ```
 
 Both `down` and `up` accept `--dry-run`, which prints every step and each command it would run, using read-only calls only. Run it first to see exactly what will happen. `down --yes` skips the confirmation prompt.

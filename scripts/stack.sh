@@ -161,7 +161,7 @@ cmd_up() {
   [ -n "$SNAPSHOT" ] && [ "$SNAPSHOT" != None ] || die "no final snapshot found - pass --snapshot ID"
   local snap_user; snap_user=$(aws rds describe-db-snapshots --db-snapshot-identifier "$SNAPSHOT" --query 'DBSnapshots[0].MasterUsername' --output text)
 
-  say "Plan: recreate $STACK from snapshot $SNAPSHOT (expect 35-50 min)"
+  say "Plan: recreate $STACK from snapshot $SNAPSHOT (expect 30-45 min)"
   local overrides=()
   while IFS='=' read -r k v; do overrides+=("$k=$v"); done < <(python3 -c "
 import json,sys
