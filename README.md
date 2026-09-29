@@ -123,6 +123,7 @@ flowchart LR
 | The old HTTP-only ALB listener/security-group rule was deleted outright, not converted to an HTTPS redirect | The CloudFront origin-facing prefix list has 46 entries, and each security-group rule referencing it consumes 46 rule slots against a 60-per-group quota — keeping both an HTTP and HTTPS CloudFront-facing rule simultaneously (92 slots) isn't possible without a quota increase. A manual out-of-band fix (revoking the old rule before redeploying) was needed since CloudFormation's own create-before-delete ordering hit the same limit mid-update |
 | MySQL upgraded from 8.0 to 8.4 (LTS), not just left on 8.0 | 8.0 quietly exited AWS/Oracle standard support, triggering a per-vCPU-hour Extended Support surcharge that bills continuously regardless of how small or new the database is - 8.4 has no such surcharge. The read replica had to be upgraded to 8.4 *before* the primary, out-of-band via the RDS API directly - CloudFormation's own dependency graph (`DBReadReplica` depends on `DBInstance`) always processes the primary first, which RDS's own major-version-upgrade API rejects when an old-version replica still exists |
 | Deploys will upload the template to an S3 bucket the stack owns (`CfnArtifactsBucket`) instead of sending it inline | Inline `TemplateBody` is capped at 51,200 bytes, and this template reached that limit twice. The bucket is part of the stack and auto-named inside the deploy role's existing S3 scope, so the role only needed object-level permissions added, not access to anything new |
+| The CI deploy role lives in its own manually deployed stack (`pipeline.yaml`), not in the stack it deploys | A role that deploys its own permissions can always escalate them. Moving it out, adding an explicit self-Deny, and requiring a permissions boundary on every role it grants to means a compromised workflow run is capped at the app's own permissions, not account admin |
 | `DBPassword`'s `AllowedPattern` excludes `'` and `\`, not just `/`, `@`, `"`, and whitespace | Found during a security review: `db-config.php` embeds the password inside a single-quoted PHP string literal, so an unescaped `'` in a chosen password would cause a fatal PHP parse error on every instance boot — a self-inflicted outage from an otherwise-valid password. The older `wp-config.php` `sed` substitution wasn't vulnerable to this specific character |
 
 ## Security review
@@ -139,6 +140,7 @@ Adding the RDS read replica was followed by a dedicated security/architecture re
 **Found and fixed**:
 - `DBPassword`'s `AllowedPattern` didn't exclude `'` or `\`, which could break `db-config.php`'s PHP string literal and take the site down on a future password rotation — see the table above.
 - The DB master password was leaking into CloudWatch Logs: `UserData` runs under `bash -x`, which echoed the `sed` line writing the password into `wp-config.php` into `cloud-init-output.log` — a log group the CloudWatch agent ships off-instance. Confirmed on the live stack by counting matching log events (without printing them), fixed by disabling tracing around the credential lines. The fix only stops new leaks — already-written log events and the password itself must be treated as exposed (delete the old streams, rotate the password) — see [Deployment.md](Deployment.md#the-db-password-used-to-leak-into-the-cloud-init-log).
+- The CI deploy role could grant itself admin: its IAM permissions covered `role/three-tier-app-*`, which matched its own name, because it had to update its own policy through CloudFormation. It now lives in a separate, manually deployed `pipeline.yaml` stack with an explicit self-Deny. Any IAM grant it makes has to carry a permissions boundary that caps the result at the app's own needs — see [Deployment.md](Deployment.md#why-the-deploy-role-lives-in-its-own-stack).
 
 **Found, not yet fixed (flagged for a deliberate decision, not an oversight)**:
 - Neither RDS instance is encrypted at rest. This predates the replica, but a replica must match its source's encryption status, so the gap is now on two instances instead of one. Remediation requires snapshot → restore-as-encrypted for the primary (a new endpoint, genuinely disruptive) before the replica could be recreated encrypted too.
@@ -151,8 +153,10 @@ Full methodology (exact commands, the counter values, the `read_only` proof) is 
 ```
 .
 ├── cloudformation/
-│   └── vpc.yaml                  # VPC, ALB + Auto Scaling Group, RDS primary + read replica, EFS,
-│                                  # CloudWatch dashboard, logging (S3 + CloudWatch Logs), GitHub OIDC deploy role
+│   ├── vpc.yaml                  # VPC, ALB + Auto Scaling Group, RDS primary + read replica, EFS,
+│   │                              # CloudWatch dashboard, logging (S3 + CloudWatch Logs)
+│   └── pipeline.yaml             # GitHub OIDC deploy role, Backup service role, permissions boundary
+│                                  # (deployed manually by an admin, never by CI)
 ├── terraform/                    # Earlier, simpler baseline (see note below) — not feature-equivalent
 ├── .github/workflows/deploy.yml  # CI/CD: GitHub OIDC authentication, deploy on push to main
 ├── Deployment.md                 # Full deployment guide, every parameter, and an extensive
