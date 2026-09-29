@@ -532,6 +532,13 @@ CloudFront sits in front of the ALB as the actual public entry point, with a ded
 
 **Cost added**: WAF has a flat ~$5/month Web ACL fee plus ~$1/month per rule group (2 here, ~$7/month total) plus a small per-million-requests charge; CloudFront itself is likely near-free at this project's traffic level (within or close to its own free tier for data transfer/requests). Brings the running total from the earlier ~$50-54/month estimate to roughly **$57-61/month**.
 
+**Added later (second security review):**
+- **`RateLimitLoginAndXmlRpc`** (Block): more than 100 requests per IP in 5 minutes to `/wp-login.php` or `/xmlrpc.php` is blocked. It's scoped to those two paths so normal browsing (and CloudFront-cached traffic) is never counted toward it.
+- **`AWSManagedRulesKnownBadInputsRuleSet`, `AWSManagedRulesWordPressRuleSet`, `AWSManagedRulesPHPRuleSet`**, all in **Count** mode (`OverrideAction: Count`). The earlier `SizeRestrictions_BODY` and `CrossSiteScripting_BODY` false positives showed that managed rules can break real WordPress traffic. So these first run in Count mode: check the WAF logs for matches on legitimate requests, then switch each one to `OverrideAction: None` (Block). See "WAF logs and promoting Count rules to Block" below.
+- **WAF logging** to CloudWatch Logs, in log group `aws-waf-logs-<EnvironmentName>`. WAF requires the `aws-waf-logs-` prefix, and `us-east-1` for a CloudFront-scoped ACL. `cookie` and `authorization` headers are redacted, since WordPress auth cookies would otherwise be logged in full. Retention is `LogRetentionDays`.
+- **Capacity**: 1,321 of the 1,500 WCU a web ACL allows, checked with `aws wafv2 check-capacity` before deploying.
+- **Cost**: about +$4/month (three more rule groups plus one rule at ~$1 each), plus CloudWatch Logs ingestion for the WAF logs (vended-log pricing, pennies at this traffic).
+
 ### Custom domain (`blog.securecloudengineers.com`)
 
 `CustomDomainCertificate` is a DNS-validated ACM certificate for `CustomDomainName` (`blog.securecloudengineers.com` by default), created in `us-east-1` — a hard CloudFront requirement, regardless of which region the rest of the stack lives in. `DomainValidationOptions` with `HostedZoneId` lets CloudFormation create the validation CNAME itself and wait for issuance as part of the stack update; no manual console step, and no leftover validation record after a delete.
@@ -597,6 +604,30 @@ UPDATE wp_options SET option_value="<current-WordPressURL-output>" WHERE option_
 
 **Since the Redis object cache was added, also flush it after this SQL update** — see "Direct SQL writes to `wp_options` no longer take effect on their own" under "Redis object cache" above for why and the exact command.
 
+### WAF logs and promoting Count rules to Block
+
+```bash
+# live tail (one JSON record per request; terminatingRuleId shows what decided it)
+aws logs tail aws-waf-logs-<EnvironmentName> --region us-east-1 --follow
+
+# which Count-mode rules matched what, over the last 7 days (Logs Insights)
+q=$(aws logs start-query --region us-east-1 --log-group-name aws-waf-logs-<EnvironmentName> \
+  --start-time $(date -d '7 days ago' +%s) --end-time $(date +%s) \
+  --query-string 'fields @timestamp, httpRequest.uri, httpRequest.clientIp
+    | filter ispresent(nonTerminatingMatchingRules.0.ruleId)
+    | stats count(*) by nonTerminatingMatchingRules.0.ruleId, httpRequest.uri
+    | sort count(*) desc' --query queryId --output text)
+sleep 10; aws logs get-query-results --region us-east-1 --query-id "$q"
+```
+
+When the Count-mode rule groups only match obvious attack traffic (scanners, `/.env`, `/wp-config.php.bak` and similar), change that group's `OverrideAction` from `Count: {}` to `None: {}` in the template. That's a normal PR, and the change is non-disruptive. If one specific rule inside a group hits legitimate requests, override just that rule to `Count` with `RuleActionOverrides` (the same pattern as `SizeRestrictions_BODY`) instead of leaving the whole group in Count.
+
+Test the rate limit (it should switch from WordPress's own `200` to WAF's `403` after about 100 requests, within a minute or two; WAF rate-based rules aggregate with some delay):
+
+```bash
+for i in $(seq 1 130); do curl -s -o /dev/null -w "%{http_code}\n" https://<domain>/wp-login.php; done | sort | uniq -c
+```
+
 ### Verify the WAF is actually blocking attacks (not just attached)
 
 Same principle as everywhere else in this file — attached and configured isn't the same as actually working. Send requests that AWS's managed rule groups are documented to match, and confirm they're blocked (`403`), while a normal request still succeeds:
@@ -631,9 +662,9 @@ If the SQLi/XSS requests return `200` instead of `403`, the rules aren't actuall
 - **Cause**: `AWSManagedRulesCommonRuleSet`'s `CrossSiteScripting_BODY` rule flags request bodies containing patterns that look like XSS payloads. Inline `style` attributes (and similar HTML constructs the block editor legitimately produces) can trip this same heuristic — it has no way to distinguish WordPress's own generated markup from an actual injected `<script>` tag, so it blocks both identically.
 - **Fix**: same two-part pattern as `SizeRestrictions_BODY`, but scoped more precisely since disabling XSS-body detection entirely would be a real reduction in protection (unlike the size rule, which had no content-safety role to begin with):
   1. `RuleActionOverrides` adds `CrossSiteScripting_BODY` → `Count` on the same `AWS-AWSManagedRulesCommonRuleSet` statement. The rule still evaluates and still applies its label — it just stops blocking on its own.
-  2. A new custom rule, `BlockXSSBodyExceptRestApi` (priority 2, evaluated after both managed rule groups), re-blocks anything carrying the `awswaf:managed:aws:core-rule-set:CrossSiteScripting_Body` label **except** requests whose URI contains `/wp-json/wp/v2/` — the WordPress REST API path used for all content edits (posts, template parts, media). Everywhere else on the site, an XSS-body match is still blocked exactly as before.
+  2. A new custom rule, `BlockXSSBodyExceptRestApi` (priority 2, evaluated after both managed rule groups), re-blocks anything carrying the `awswaf:managed:aws:core-rule-set:CrossSiteScripting_Body` label **except** requests whose URI path starts with `/wp-json/wp/v2/` or `/index.php/wp-json/wp/v2/` (originally "contains"; see below) — the WordPress REST API path used for all content edits (posts, template parts, media). Everywhere else on the site, an XSS-body match is still blocked exactly as before.
 - **How this was actually verified**: confirmed via `aws wafv2 get-sampled-requests` that `CrossSiteScripting_BODY` really was the rule firing on real production traffic (`/wp-json/wp/v2/posts/7/autosaves`, `/wp-json/wp/v2/template-parts/twentytwentyfive//footer` — the exact footer edit that prompted this fix) before changing anything. After deploying, sent the same style-attribute payload to both a REST API path (no longer blocked — reaches WordPress, confirmed by a `401` from WordPress itself, not a WAF `403`) and to `/wp-login.php` (still blocked, `403`, confirmed as a hit on the new `BlockXSSBodyExceptRestApi` rule specifically via its own metric) — proving the exception is scoped correctly, not a blanket bypass.
-- **Why the REST API path match uses `CONTAINS "/wp-json/wp/v2/"` rather than an exact prefix**: this WordPress install currently uses "plain" permalinks, so REST requests are `/index.php/wp-json/wp/v2/...`. Matching on `CONTAINS` instead of an exact `/index.php/...` prefix means the exception keeps working if permalinks are ever switched to the "pretty" structure, which drops the `/index.php` prefix.
+- **Why the REST API match is two exact prefixes, not `CONTAINS "/wp-json/wp/v2/"`**: it originally used `CONTAINS`, so the exception kept working under either permalink style. This install uses "plain" permalinks, so REST requests are `/index.php/wp-json/wp/v2/...` (confirm with `curl -sI https://<domain>/ | grep -i '^link:'`, which shows the REST root). A later security review found `CONTAINS` too loose: the substring can appear *anywhere* in the path, so `/wp-comments-post.php/wp-json/wp/v2/x` would also match and skip the XSS block for an unauthenticated endpoint (not exploit-tested, but no reason to leave it). It's now an `OrStatement` of two `STARTS_WITH` matches: `/wp-json/wp/v2/` (pretty permalinks) and `/index.php/wp-json/wp/v2/` (plain permalinks, in use). A single `STARTS_WITH "/wp-json/wp/v2/"` would have broken every editor save on this site. This entry is what caught that before it shipped.
 - **Why this doesn't weaken the WAF's actual protection everywhere else**: the exception is scoped to one specific, narrow path prefix used only for authenticated content management — an actual XSS payload sent to any other endpoint (comment forms, contact forms, arbitrary query strings) is still blocked exactly as before. Unauthenticated requests to the REST API paths still get rejected by WordPress itself (`401`/`403` from WordPress, not from WAF) — the WAF exception only means WordPress's own auth/permission checks are what stand between an attacker and that endpoint now, same as they always were for any legitimate logged-in action.
 
 ### RDS bill has an unexpected "Extended Support" charge for MySQL 8.0
@@ -818,8 +849,7 @@ Found during security architect reviews (the first for this feature; a second, s
 - **The DB master password is still plaintext in the launch template's `UserData`** (every version), readable by anyone with `ec2:DescribeLaunchTemplateVersions`, and in `wp-config.php`/`db-config.php` on each instance. The CloudWatch Logs leak is fixed (see "The DB password used to leak into the cloud-init log"), but the password itself must be treated as exposed until rotated. **Planned:** move it to Secrets Manager, fetched at boot through the instance role, which also generates a new password.
 - **Redis has no encryption in transit, at rest, or AUTH token** (`describe-cache-clusters`: `TransitEncryptionEnabled`/`AtRestEncryptionEnabled`/`AuthTokenEnabled` all `false`). Only `RedisSecurityGroup` protects it. **Planned:** an encrypted `ReplicationGroup` with TLS and an AUTH token. At-rest encryption can't be enabled on a `CacheCluster`.
 - **The ALB accepts any CloudFront distribution, not just this one.** The origin-facing prefix list covers all of CloudFront, so someone else's distribution pointed at the ALB could bypass this stack's WAF. **Planned:** a secret custom origin header from CloudFront, with the ALB listener returning a fixed 403 without it.
-- **The WAF has no rate limiting and no WordPress/PHP-specific rules** (`wp-login.php`/`xmlrpc.php` brute force is unmitigated), **no logging configuration** (only metrics and sampled requests), and the `CrossSiteScripting_BODY` exemption matches `/wp-json/wp/v2/` with `CONTAINS` rather than `STARTS_WITH`.
-- **No RDS deletion protection, no Multi-AZ** on the primary. Deletion protection is a one-line fix. Multi-AZ roughly doubles RDS cost.
+- **No Multi-AZ** on the RDS primary (roughly doubles RDS cost). Deletion protection is now on for both instances.
 - **WordPress connects as the RDS master user**, not a least-privilege application user.
 - **Smaller hardening items:** no explicit `MetadataOptions` (IMDSv2 is enforced today only by the AL2023 AMI default), plain HTTP on the in-VPC ALB→instance hop, unpinned WordPress/plugin downloads with no checksum, `chmod -R 755` leaving config files world-readable, no CloudFront security-headers policy, no `aws:SecureTransport` deny on the ALB logs bucket, GitHub Actions pinned by tag rather than SHA, and `DB_PASSWORD` interpolated straight into a `run:` shell line.
 - **Accepted, not planned:** web servers in public subnets. Moving them to private subnets needs a NAT Gateway (~$33/month + $0.045/GB), which would roughly double the running cost; the security groups already limit HTTP to the ALB and SSH to one IP.
@@ -1319,6 +1349,17 @@ The `deploy` job in `deploy.yml` targets a GitHub Environment named `production`
 - **The trust policy is branch-specific** — only pushes on `refs/heads/main` (via `GitHubBranch`, default `main`) can assume this role. A workflow run from a different branch, a fork, or a pull_request-triggered event (different `sub` claim shape) will get `AccessDenied` on the OIDC assume-role step, by design.
 
 ## Delete the stack
+
+Both RDS instances have **`DeletionProtection: true`**, so a plain `delete-stack` fails on them. Turn it off first. It's a deliberate extra step, the same guard that stops an accidental `delete-stack` from removing the database:
+
+```bash
+for id in $(aws cloudformation describe-stack-resources --stack-name three-tier-app-network --region us-east-1 \
+  --query "StackResources[?ResourceType=='AWS::RDS::DBInstance'].PhysicalResourceId" --output text); do
+  aws rds modify-db-instance --db-instance-identifier $id --no-deletion-protection --apply-immediately --region us-east-1
+done
+```
+
+This drifts from the template until the stack is gone, which doesn't matter because it's being deleted. If you change your mind, the next deploy sets it back to `true`.
 
 Delete the app stack first. The pipeline stack can't be deleted while the app stack still imports its exports.
 

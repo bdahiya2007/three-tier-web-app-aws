@@ -38,7 +38,7 @@ flowchart TB
     Internet((Internet))
     R53[Route 53<br/>blog.securecloudengineers.com]
     ACM[ACM Certificate<br/>DNS-validated]
-    WAF[AWS WAF Web ACL<br/>SQLi + Common/XSS managed rules]
+    WAF[AWS WAF Web ACL<br/>SQLi, Common/XSS, WordPress, PHP,<br/>bad-inputs rules + login rate limit]
     CF[CloudFront Distribution]
 
     subgraph VPC["VPC — 10.0.0.0/16"]
@@ -140,6 +140,7 @@ Adding the RDS read replica was followed by a dedicated security/architecture re
 - The replica's `read_only` enforcement acts as a fail-safe independent of HyperDB's own config: even a HyperDB misconfiguration couldn't cause a silent write to the replica; it would error loudly instead
 
 **Found and fixed**:
+- The WAF had no rate limiting, no WordPress/PHP rules and no logging, and its REST-API XSS exemption matched `/wp-json/wp/v2/` *anywhere* in the path. Added a per-IP rate limit on `wp-login.php`/`xmlrpc.php`, three more managed rule groups (in Count mode first), logging with cookie/authorization headers redacted, and two exact path prefixes for the exemption. A single prefix would have broken every editor save, because this install's REST API lives under `/index.php/wp-json/`. RDS deletion protection is now on for both instances.
 - `DBPassword`'s `AllowedPattern` didn't exclude `'` or `\`, which could break `db-config.php`'s PHP string literal and take the site down on a future password rotation — see the table above.
 - The DB master password was leaking into CloudWatch Logs: `UserData` runs under `bash -x`, which echoed the `sed` line writing the password into `wp-config.php` into `cloud-init-output.log` — a log group the CloudWatch agent ships off-instance. Confirmed on the live stack by counting matching log events (without printing them), fixed by disabling tracing around the credential lines. The fix only stops new leaks — already-written log events and the password itself must be treated as exposed (delete the old streams, rotate the password) — see [Deployment.md](Deployment.md#the-db-password-used-to-leak-into-the-cloud-init-log).
 - The CI deploy role could grant itself admin: its IAM permissions covered `role/three-tier-app-*`, which matched its own name, because it had to update its own policy through CloudFormation. It now lives in a separate, manually deployed `pipeline.yaml` stack with an explicit self-Deny. Any IAM grant it makes has to carry a permissions boundary that caps the result at the app's own needs — see [Deployment.md](Deployment.md#why-the-deploy-role-lives-in-its-own-stack). Verified with `iam simulate-principal-policy` against the live role: modifying itself or removing a boundary is an explicit deny. The first deploy after the move failed on a duplicate backup selection, and its rollback then got stuck, because the same Deny also blocks CloudFormation from *undoing* a boundary. Recovered with an admin `continue-update-rollback --resources-to-skip`, which kept the boundary in place — see [Deployment.md](Deployment.md#first-deploy-after-the-move-two-failures-and-a-stuck-rollback).
@@ -148,7 +149,7 @@ Adding the RDS read replica was followed by a dedicated security/architecture re
 - Neither RDS instance is encrypted at rest. This predates the replica, but a replica must match its source's encryption status, so the gap is now on two instances instead of one. Remediation requires snapshot → restore-as-encrypted for the primary (a new endpoint, genuinely disruptive) before the replica could be recreated encrypted too.
 - No TLS enforcement in transit between WordPress and RDS (`require_secure_transport` unset). Partially mitigated by VPC-level network isolation, but doesn't meet defense-in-depth for data-in-transit on its own.
 - The DB password is still plaintext in the launch template's `UserData` (planned: Secrets Manager, which also rotates it).
-- Redis has no encryption or AUTH token; the ALB accepts traffic from *any* CloudFront distribution, not just this one (a WAF bypass path); the WAF has no rate limiting, WordPress-specific rules or logging; RDS has no deletion protection; WordPress uses the DB master user.
+- Redis has no encryption or AUTH token; the ALB accepts traffic from *any* CloudFront distribution, not just this one (a WAF bypass path); RDS has no Multi-AZ; WordPress uses the DB master user. The newer WAF rule groups (WordPress, PHP, known-bad-inputs) run in Count mode until their logs are reviewed for false positives.
 - Accepted rather than planned: web servers in public subnets (a NAT Gateway would roughly double the running cost).
 
 The complete list, with verification commands and planned fixes, is in [Deployment.md](Deployment.md#known-security-gaps-not-yet-remediated--flagged-for-a-decision-not-overlooked).
