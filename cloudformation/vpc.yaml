@@ -956,6 +956,10 @@ Resources:
           Fn::Base64:
             !Sub |
               #!/bin/bash -xe
+              # cfn-signal first, so any later failure is reported to CloudFormation at
+              # once (the ERR trap) instead of it waiting out the signal timeout.
+              dnf install -y aws-cfn-bootstrap
+              trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource WebServerAutoScalingGroup --region ${AWS::Region} || true' ERR
               dnf update -y
               dnf install -y httpd php8.3 php8.3-mysqlnd php8.3-fpm php8.3-gd php8.3-xml php8.3-mbstring php8.3-pecl-redis6 mariadb105 amazon-efs-utils amazon-cloudwatch-agent wget unzip
 
@@ -1128,14 +1132,44 @@ Resources:
 
               systemctl restart httpd
 
+              # Ready = both DB endpoints accept the secret's password AND WordPress
+              # answers. A page load alone isn't proof: the Redis object cache can serve
+              # pages with a dead DB. Retries for up to 10 min, since scripts/stack.sh up
+              # sets a restored DB's password while instances may already be booting.
+              # Tracing off so the password never reaches cloud-init-output.log.
+              set +x
+              ready=false
+              for i in $(seq 1 20); do
+                export MYSQL_PWD=$(php -r 'include "/etc/wordpress/db-secret.php"; echo DB_PASSWORD;')
+                if mysql -h ${DBInstance.Endpoint.Address} -u '${DBUsername}' -N -e 'SELECT 1' >/dev/null 2>&1 \
+                   && mysql -h ${DBReadReplica.Endpoint.Address} -u '${DBUsername}' -N -e 'SELECT 1' >/dev/null 2>&1 \
+                   && curl -s -f -o /dev/null http://localhost/; then
+                  ready=true; break
+                fi
+                echo "not ready yet (attempt $i/20): DB login or local WordPress check failed"
+                sleep 30
+              done
+              unset MYSQL_PWD
+              set -x
+              $ready
+              /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource WebServerAutoScalingGroup --region ${AWS::Region} \
+                || echo "cfn-signal not accepted - normal outside a stack create/update (e.g. an ASG health replacement)"
+
   WebServerAutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
-    # MinInstancesInService=AsgMinSize: replaces instances without dipping below it.
+    # Each new instance signals when it can really log in to the DB (end of
+    # UserData), so updates move on as soon as it's ready and roll back if it
+    # never is. PauseTime is now that signal's timeout, not a fixed wait.
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref AsgDesiredCapacity
+        Timeout: PT20M
     UpdatePolicy:
       AutoScalingRollingUpdate:
         MinInstancesInService: !Ref AsgMinSize
         MaxBatchSize: 1
-        PauseTime: PT10M
+        WaitOnResourceSignals: true
+        PauseTime: PT20M
     Properties:
       AutoScalingGroupName: !Sub ${EnvironmentName}-asg
       VPCZoneIdentifier:
