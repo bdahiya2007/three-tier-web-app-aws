@@ -1,14 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Three-tier web app. VPC (us-east-1, two AZs) with CloudFront+WAF (SQLi + XSS
-  rules) in front of an HTTPS ALB + Auto Scaling Group (2-3 instances) running
-  WordPress across two public subnets - the ALB only accepts traffic from
-  CloudFront's IPs. A MySQL RDS primary plus a read replica in the second AZ
-  (writes to the primary, reads to the replica via HyperDB) and a Redis object
-  cache reduce DB load, EFS-shared wp-content, a CloudWatch dashboard, logging
-  (ALB access logs to S3, instance/RDS logs to CloudWatch Logs), and a GitHub
-  Actions deploy role via OIDC. The primary RDS instance is single-AZ; the
-  second private subnet satisfies RDS's subnet-group requirement and hosts the replica.
+  Three-tier WordPress: CloudFront+WAF -> HTTPS ALB (CloudFront IPs only) -> ASG
+  in two public subnets; single-AZ MySQL primary + read replica (HyperDB split),
+  Redis object cache, EFS wp-content, CloudWatch dashboard/logs, OIDC deploy role.
 
 Parameters:
   EnvironmentName:
@@ -162,10 +156,8 @@ Parameters:
     Type: String
     Default: pl-3b927c52
     Description: >-
-      AWS-managed prefix list ID for CloudFront's origin-facing IP ranges. Restricts
-      the ALB's security group to CloudFront only, so its WAF can't be bypassed via
-      the ALB's DNS name. Consistent across accounts; verify with `aws ec2
-      describe-managed-prefix-lists --filters Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing`.
+      CloudFront origin-facing prefix list (com.amazonaws.global.cloudfront.origin-facing).
+      Restricts the ALB SG to CloudFront IPs, blocking direct hits on the ALB's DNS name.
 
   CloudFrontPriceClass:
     Type: String
@@ -200,11 +192,8 @@ Parameters:
     Type: String
     Default: '5674538'
     Description: >-
-      Numeric, immutable GitHub user/org ID for GitHubOrg (find via `gh api users/<org> --jq .id`).
-      GitHub's OIDC "sub" claim embeds this alongside the name (repo:org@id/repo@id:ref:...) so the
-      trust policy still matches correctly even if the org/user is ever renamed - and, just as
-      importantly, so a *different* account that later reuses the same renamed username can't assume
-      this role by name alone.
+      Immutable numeric ID for GitHubOrg (`gh api users/<org> --jq .id`). Part of the OIDC
+      "sub" claim, so a rename - or another account reusing the old name - can't match.
 
   GitHubRepo:
     Type: String
@@ -213,8 +202,7 @@ Parameters:
   GitHubRepoId:
     Type: String
     Description: >-
-      Numeric, immutable GitHub repository ID for GitHubRepo (find via `gh api repos/<org>/<repo> --jq .id`).
-      Same reasoning as GitHubOrgId - matched as part of the OIDC "sub" claim, not just the repo name.
+      Immutable numeric ID for GitHubRepo (`gh api repos/<org>/<repo> --jq .id`); see GitHubOrgId.
 
   GitHubBranch:
     Type: String
