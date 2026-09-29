@@ -274,7 +274,8 @@ def restore(wp, src_root, dry):
             body = {"name": t["name"], "slug": t["slug"], "description": t.get("description", "")}
             if t.get("parent"):
                 body["parent"] = term_map[kind].get(t["parent"], 0)
-            term_map[kind][t["id"]] = upsert(wp, f"/wp/v2/{kind}", t["slug"], body, dry, kind[:-1])
+            label = {"categories": "category", "tags": "tag"}[kind]
+            term_map[kind][t["id"]] = upsert(wp, f"/wp/v2/{kind}", t["slug"], body, dry, label)
 
     media_map, url_map = {}, {}
     for m in read_json(src / "media.json", []):
@@ -374,6 +375,10 @@ def restore(wp, src_root, dry):
                          ("site_logo", media_map), ("site_icon", media_map)):
         if settings.get(key):
             settings[key] = mapping.get(settings[key], 0)
+    # WordPress rejects 0 for these ("cannot be updated to null"): only send a real logo/icon.
+    for key in ("site_logo", "site_icon"):
+        if not settings.get(key):
+            settings.pop(key, None)
     if dry:
         print(f"  would set settings: {', '.join(sorted(settings))}")
     else:

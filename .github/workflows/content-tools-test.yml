@@ -57,8 +57,11 @@ jobs:
           # Source mirrors the live site's /index.php/ permalinks; target stays
           # plain (?rest_route=), so both REST root styles get exercised.
           wpcli source rewrite structure '/index.php/%postname%/'
-          echo "SRC_PW=$(wpcli source user application-password create admin ci --porcelain)" >> "$GITHUB_ENV"
-          echo "DST_PW=$(wpcli target user application-password create admin ci --porcelain)" >> "$GITHUB_ENV"
+          # Throwaway localhost sites, but mask the passwords in logs anyway.
+          src=$(wpcli source user application-password create admin ci --porcelain)
+          dst=$(wpcli target user application-password create admin ci --porcelain)
+          echo "::add-mask::$src"; echo "::add-mask::$dst"
+          echo "SRC_PW=$src" >> "$GITHUB_ENV"; echo "DST_PW=$dst" >> "$GITHUB_ENV"
 
       - name: Create representative content on the source site
         run: |
