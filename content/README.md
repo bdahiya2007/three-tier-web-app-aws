@@ -44,6 +44,8 @@ The AWS backups (daily RDS and EFS recovery points in AWS Backup, a final snapsh
    ```
 4. **Run it once:** `gh workflow run content-backup.yml`, then merge the PR it opens.
 
+**Approving each backup PR's check:** GitHub holds workflows on PRs opened by `github-actions[bot]` until a human approves them. The PR's own `validate` run shows **action_required**, and it keeps the PR `BLOCKED` even though the run dispatched by `content-backup.yml` already passed on the same commit (same check name, so the held run counts as pending). On the PR, click **"Approve workflows to run"** (or Actions → the waiting run → **Approve and run**), wait about 20 seconds, then merge. That's one click per weekly PR, which suits a PR you review anyway.
+
 ## Disaster recovery: rebuild the blog from the repo
 
 1. Stand up WordPress anywhere: this stack (see "Deploy the stack" in [Deployment.md](../Deployment.md)), another account, or another host. Finish the setup wizard, **activate the same theme** (`content/wordpress/theme.json`), and create an Application Password there.

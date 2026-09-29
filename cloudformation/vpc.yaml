@@ -1160,10 +1160,9 @@ Resources:
       DBInstanceClass: !Ref DBInstanceClass
       AllocatedStorage: !Ref DBAllocatedStorage
       MasterUsername: !Ref DBUsername
-      # CloudFormation only re-applies this when the reference *text* changes, not
-      # when the secret's value does - the explicit :AWSCURRENT was added in the
-      # same change that switched DBMasterSecret to a generated value, so RDS got
-      # the new password (see "Rotate the DB password" in Deployment.md).
+      # Never change DBMasterSecret's value and this reference in one deploy: the
+      # first rotation did, and RDS ended up on a different password than the
+      # secret. Rotate out of band instead ("Rotate the DB password", Deployment.md).
       MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBMasterSecret}:SecretString:password:AWSCURRENT}}'
       DBSnapshotIdentifier: !If [RestoreFromSnapshot, !Ref DBSnapshotIdentifier, !Ref 'AWS::NoValue']
       DBSubnetGroupName: !Ref DBSubnetGroup
