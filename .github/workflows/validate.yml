@@ -48,10 +48,10 @@ jobs:
       - name: Lint CloudFormation template
         run: cfn-lint ${{ env.TEMPLATE_FILE }}
 
-      # cfn-lint doesn't check this; deploy.yml's --template-body has a hard
-      # 51,200-byte limit that otherwise only fails after merge.
+      # cfn-lint doesn't check this; deploy.yml's S3-based TemplateURL has a
+      # hard 1 MB limit that would otherwise only fail after merge.
       - name: Check template size
         run: |
           size=$(wc -c < ${{ env.TEMPLATE_FILE }})
-          echo "Template size: $size / 51200 bytes"
-          test "$size" -le 51200
+          echo "Template size: $size / 1048576 bytes"
+          test "$size" -le 1048576
