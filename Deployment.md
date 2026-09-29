@@ -284,7 +284,7 @@ aws cloudformation deploy \
   --parameter-overrides AsgMinSize=2 AsgDesiredCapacity=2
 ```
 
-Omitted parameters (`DBPassword`, `KeyPairName`, `GitHubRepo`, `GitHubRepoId`, etc.) reuse their current stored values automatically — no need to re-supply them just to change the ASG size. `AsgMaxSize` (default `3`) is left alone either way, so the group can still burst up under load even while scaled down to a 1-instance floor.
+Omitted parameters (`DBPassword`, `KeyPairName`, etc.) reuse their current stored values automatically — no need to re-supply them just to change the ASG size. `AsgMaxSize` (default `3`) is left alone either way, so the group can still burst up under load even while scaled down to a 1-instance floor.
 
 Scaling down to 1 removes the multi-AZ redundancy that scaling to 2+ provides — acceptable for a deliberately idle period, not for normal operation. Scaling to `0` is also possible (maximum savings, but the ALB returns `503` to any visitor until scaled back up, and a scale-up from `0` means every instance is a cold boot — full `UserData` bootstrap, EFS mount, WordPress install — rather than most instances already being warm).
 
@@ -1164,7 +1164,9 @@ EOF
 
 ### One-time AWS-side setup (already done for this stack)
 
-`GitHubActionsDeployRole` is defined in `cloudformation/vpc.yaml` itself, parameterized by `GitHubOrg`/`GitHubOrgId`/`GitHubRepo`/`GitHubRepoId`/`GitHubBranch` (defaults: `bdahiya2007` / `5674538` / this repo's name / this repo's numeric ID / `main`). It trusts the **existing** account-wide GitHub OIDC provider (`token.actions.githubusercontent.com`) — that provider is a one-per-AWS-account resource, so if your account already has one from another project, this template does not (and must not) try to create a duplicate; it only adds a new role that references the existing provider by ARN.
+`GitHubActionsDeployRole` (`three-tier-app-pipeline-deploy-role`) is defined in its own stack, **`cloudformation/pipeline.yaml`** (stack name `three-tier-app-pipeline`), deployed **manually by an admin, never by the pipeline** — see "Why the deploy role lives in its own stack" below. It's parameterized by `GitHubOrg`/`GitHubOrgId`/`GitHubRepo`/`GitHubRepoId`/`GitHubBranch` (defaults: `bdahiya2007` / `5674538` / this repo's name / this repo's numeric ID / `main`). It trusts the **existing** account-wide GitHub OIDC provider (`token.actions.githubusercontent.com`) — that provider is a one-per-AWS-account resource, so if your account already has one from another project, this template does not (and must not) try to create a duplicate; it only adds a new role that references the existing provider by ARN.
+
+The pipeline stack also owns the AWS Backup service role and `AppRoleBoundary` (a permissions boundary), and exports both ARNs for the app stack to import. **Deploy it before the app stack**, since the app stack's `Fn::ImportValue`s fail without it.
 
 **`GitHubRepoId` has no default and must be supplied** — it's specific to whatever repo you're deploying from. Get it with:
 
@@ -1174,26 +1176,28 @@ gh api repos/<your-github-username>/<your-repo-name> --jq '.id'
 
 (and `gh api users/<your-github-username> --jq '.id'` for `GitHubOrgId`, if different from the default above).
 
-Since a workflow can't assume a role that doesn't exist yet, this role has to be created by a manual, already-authenticated `deploy` at least once (chicken-and-egg — CI can't bootstrap its own trust relationship):
+A workflow can't assume a role that doesn't exist yet, and by design it can't modify this stack either. So create or update it manually, with your own admin credentials:
 
 ```bash
 aws cloudformation deploy \
-  --template-file cloudformation/vpc.yaml \
-  --stack-name three-tier-app-network \
+  --template-file cloudformation/pipeline.yaml \
+  --stack-name three-tier-app-pipeline \
   --region us-east-1 \
   --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides GitHubRepo=<your-repo-name> GitHubRepoId=<your-repo-id> DBPassword=<your-db-password> KeyPairName=<your-key-pair-name>
+  --parameter-overrides GitHubRepo=<your-repo-name> GitHubRepoId=<your-repo-id>
 ```
 
 After that, get the role's ARN from the stack output:
 
 ```bash
 aws cloudformation describe-stacks \
-  --stack-name three-tier-app-network \
+  --stack-name three-tier-app-pipeline \
   --region us-east-1 \
-  --query "Stacks[0].Outputs[?OutputKey=='GitHubActionsDeployRoleArn'].OutputValue" \
+  --query "Stacks[0].Outputs[?OutputKey=='DeployRoleArn'].OutputValue" \
   --output text
 ```
+
+Any change to the deploy role's permissions (for example, a new AWS service the app stack starts using) is a `pipeline.yaml` change that **you** deploy with this command after the PR merges. The pipeline won't do it for you.
 
 ### Required repository secrets
 
@@ -1201,7 +1205,7 @@ Set these under **Settings → Secrets and variables → Actions → Repository 
 
 | Secret | Value |
 |---|---|
-| `AWS_DEPLOY_ROLE_ARN` | The `GitHubActionsDeployRoleArn` output from above, e.g. `arn:aws:iam::<account-id>:role/three-tier-app-github-actions-deploy-role` |
+| `AWS_DEPLOY_ROLE_ARN` | The pipeline stack's `DeployRoleArn` output from above, e.g. `arn:aws:iam::<account-id>:role/three-tier-app-pipeline-deploy-role` |
 | `DB_PASSWORD` | Value for the `DBPassword` parameter (8-41 chars, no `/`, `@`, `"`, `'`, `\`, or spaces) |
 | `KEY_PAIR_NAME` | Name of an existing EC2 key pair in `us-east-1` (`KeyPairName` parameter) |
 
@@ -1214,13 +1218,24 @@ Scoped deliberately, not a broad managed policy:
 - **EC2, Auto Scaling, RDS, ELBv2, EFS, ElastiCache, AWS Backup, Logs, CloudWatch, Lambda, SSM, CloudFront, WAFv2, ACM**: action list scoped to only what a deploy needs (not `service:*` wildcards, except where AWS groups related actions like `autoscaling:*`/`rds:*`/`elasticfilesystem:*`/`elasticache:*`/`backup:*`/`cloudfront:*`/`wafv2:*`/`acm:*` themselves) — but on `Resource: "*"`, since most of these create/describe/modify actions genuinely don't support resource-level ARN restriction in AWS's own IAM implementation (a documented AWS limitation, not a shortcut here). ACM specifically has no such restriction to apply anyway: a certificate's ARN doesn't exist yet at policy-write time, and DNS-validated certs are typically single-use per domain.
 - **Route 53**: restricted to the one hosted zone this stack adds a record into (`arn:aws:route53:::hostedzone/<id>`), not `route53:*` on every zone in the account — unlike most of the list above, Route 53 record actions genuinely do support resource-level ARN restriction, so there was no reason not to use it. `route53:GetChange` is the one exception (`Resource: "*"`) since change IDs aren't scoped to a zone.
 - **S3**: restricted to bucket names starting with `three-tier-app-network-` (this stack's naming convention for the ALB logs bucket).
-- **IAM**: the tightest of all, since over-broad IAM permissions on a CI role is a privilege-escalation risk — restricted to role/instance-profile ARNs starting with `three-tier-app-` (this stack's own resources only, including the role itself, so future deploys can still update its own permissions).
+- **IAM**: the tightest of all, since over-broad IAM permissions on a CI role are a privilege-escalation risk. See the next section.
+
+### Why the deploy role lives in its own stack
+
+**Found in a security review:** the deploy role used to live in `vpc.yaml`, and its IAM statement allowed `iam:CreateRole`/`PutRolePolicy`/`AttachRolePolicy` on `role/three-tier-app-*`. That pattern matches the deploy role's own name, and it had to: CloudFormation updated the role's policy using the role's own credentials. So anything holding its credentials could attach `AdministratorAccess` to itself, or create a new `three-tier-app-*` role with any trust policy and any permissions. **A role that deploys its own permissions can always escalate them**, and tightening the conditions doesn't fix that. The fix is structural, the same pattern as CDK's bootstrap stack:
+
+- **The role moved to `pipeline.yaml`**, a separate stack only an admin deploys. `vpc.yaml` no longer contains it, and an explicit `Deny iam:*` on its own ARN (and on `policy/three-tier-app-pipeline-*`) overrides every Allow.
+- **Permission-granting IAM actions require `AppRoleBoundary`.** `CreateRole`, `PutRolePolicy`, `AttachRolePolicy` and `PutRolePermissionsBoundary` only succeed on a role whose permissions boundary is `three-tier-app-pipeline-app-role-boundary` (the `iam:PermissionsBoundary` condition). The boundary allows only what the app's own roles need: the CloudWatch agent's actions, log retention, and reading `three-tier-app-*` secrets. Even an admin policy attached to such a role yields nothing more. `iam:DeleteRolePermissionsBoundary` is explicitly denied, so the cap can't be removed.
+- **The AWS Backup service role moved to `pipeline.yaml` as well.** Its AWS-managed policy (EC2/RDS/KMS/DynamoDB/…) is far broader than the boundary, so the pipeline must not be able to create or edit a role like it. The app stack imports its ARN, and the pipeline can only `PassRole`/`GetRole` it.
+- **Non-escalating IAM actions** (read, tag, delete, detach, instance-profile plumbing, `PassRole`) remain on `role/three-tier-app-*`. Every role they could touch or pass is capped by the boundary or owned by the pipeline stack.
+
+**Residual risk, knowingly accepted:** anyone who can merge to `main` *and* approve the `production` deployment can still change what the app stack does within these limits. That's what the pipeline is for, and branch protection plus the approval gate cover it. The pipeline stack's own changes need your admin credentials.
 
 ### What `validate.yml` does (pull requests)
 
 1. Checks out the repo.
 2. Installs `cfn-lint` (Python, via `pip`).
-3. Runs `cfn-lint cloudformation/vpc.yaml`.
+3. Runs `cfn-lint cloudformation/vpc.yaml cloudformation/pipeline.yaml`.
 
 No AWS credentials, no `deploy` step — this job's only purpose is to catch template-level mistakes before merge. `cfn-lint`'s exit code is non-zero for warnings too, not just errors, so it fails the check on `W`-level findings — see "cfn-lint W3005 / W1011 findings" in Troubleshooting for the two patterns already hit and how they were resolved.
 

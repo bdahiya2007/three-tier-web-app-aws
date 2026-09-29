@@ -3,7 +3,7 @@ name: Validate CloudFormation Template
 # Runs on every pull request targeting main. Offline cfn-lint only, no AWS
 # credentials - a pull_request-triggered OIDC token has a different "sub" claim
 # shape than a push (repo:org/repo:pull_request vs. repo:org@id/repo@id:ref:refs/
-# heads/main), which GitHubActionsDeployRole's trust policy (cloudformation/vpc.yaml)
+# heads/main), which GitHubActionsDeployRole's trust policy (cloudformation/pipeline.yaml)
 # deliberately does not authorize, so this workflow intentionally never attempts
 # to assume it.
 #
@@ -25,6 +25,7 @@ concurrency:
 
 env:
   TEMPLATE_FILE: cloudformation/vpc.yaml
+  PIPELINE_TEMPLATE_FILE: cloudformation/pipeline.yaml
 
 jobs:
   validate:
@@ -46,7 +47,7 @@ jobs:
         run: pip install cfn-lint
 
       - name: Lint CloudFormation template
-        run: cfn-lint ${{ env.TEMPLATE_FILE }}
+        run: cfn-lint ${{ env.TEMPLATE_FILE }} ${{ env.PIPELINE_TEMPLATE_FILE }}
 
       # cfn-lint doesn't check this; deploy.yml's S3-based TemplateURL has a
       # hard 1 MB limit that would otherwise only fail after merge.

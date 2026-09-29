@@ -1,0 +1,316 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Pipeline bootstrap for the three-tier app: the GitHub Actions deploy role, the
+  AWS Backup service role, and the permissions boundary every app-stack role must
+  carry. Deployed manually by an admin - never by the pipeline itself - so the
+  deploy role can't change its own permissions (see Deployment.md).
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: three-tier-app
+    Description: Must match the app stack's EnvironmentName (role name prefix).
+
+  AppStackName:
+    Type: String
+    Default: three-tier-app-network
+    Description: Name of the app stack this role deploys.
+
+  Route53HostedZoneId:
+    Type: String
+    Default: Z06930743HC9RLGHJO306
+    Description: Hosted zone the app stack adds its DNS records to.
+
+  GitHubOrg:
+    Type: String
+    Default: bdahiya2007
+    Description: GitHub username/org for OIDC trust.
+
+  GitHubOrgId:
+    Type: String
+    Default: '5674538'
+    Description: >-
+      Immutable numeric ID for GitHubOrg (`gh api users/<org> --jq .id`). Part of the OIDC
+      "sub" claim, so a rename - or another account reusing the old name - can't match.
+
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name (no owner).
+
+  GitHubRepoId:
+    Type: String
+    Description: Immutable numeric ID for GitHubRepo (`gh api repos/<org>/<repo> --jq .id`).
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch allowed to assume the deploy role.
+
+Resources:
+  # Caps every role the app stack creates or edits (the deploy role can only write
+  # IAM policies onto roles carrying this). Even an admin policy on one of them
+  # yields no more than this: CloudWatch agent + log retention + app secrets.
+  AppRoleBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${EnvironmentName}-pipeline-app-role-boundary
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudWatchAgentAndLogs
+            Effect: Allow
+            Action:
+              - cloudwatch:PutMetricData
+              - ec2:DescribeVolumes
+              - ec2:DescribeTags
+              - logs:PutLogEvents
+              - logs:PutRetentionPolicy
+              - logs:DescribeLogStreams
+              - logs:DescribeLogGroups
+              - logs:CreateLogStream
+              - logs:CreateLogGroup
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+              - xray:GetSamplingRules
+              - xray:GetSamplingTargets
+              - xray:GetSamplingStatisticSummaries
+            Resource: '*'
+          - Sid: CloudWatchAgentConfig
+            Effect: Allow
+            Action: ssm:GetParameter
+            Resource: !Sub arn:aws:ssm:*:${AWS::AccountId}:parameter/AmazonCloudWatch-*
+          - Sid: AppSecrets
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${EnvironmentName}-*
+
+  # Lives here, not in the app stack: its AWS managed policy is far broader than
+  # the boundary above, so the deploy role must not be able to create or edit it.
+  BackupServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-pipeline-backup-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+
+  GitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-pipeline-deploy-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # sub changes to "...:environment:production" with a job environment.
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}@${GitHubOrgId}/${GitHubRepo}@${GitHubRepoId}:ref:refs/heads/${GitHubBranch}
+                  - !Sub repo:${GitHubOrg}@${GitHubOrgId}/${GitHubRepo}@${GitHubRepoId}:environment:production
+      Policies:
+        - PolicyName: DeployThreeTierStack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudFormationStackAccess
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListStackResources
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*
+              - Sid: CloudFormationTemplateValidation
+                Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: '*'
+              # The app stack reads this stack's exports (boundary + backup role ARNs).
+              - Sid: CloudFormationReadExports
+                Effect: Allow
+                Action: cloudformation:ListExports
+                Resource: '*'
+              - Sid: InfrastructureServices
+                Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - ec2:CreateVpc
+                  - ec2:DeleteVpc
+                  - ec2:ModifyVpcAttribute
+                  - ec2:CreateSubnet
+                  - ec2:DeleteSubnet
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:CreateInternetGateway
+                  - ec2:DeleteInternetGateway
+                  - ec2:AttachInternetGateway
+                  - ec2:DetachInternetGateway
+                  - ec2:CreateRouteTable
+                  - ec2:DeleteRouteTable
+                  - ec2:CreateRoute
+                  - ec2:DeleteRoute
+                  - ec2:AssociateRouteTable
+                  - ec2:DisassociateRouteTable
+                  - ec2:CreateLaunchTemplate
+                  - ec2:CreateLaunchTemplateVersion
+                  - ec2:ModifyLaunchTemplate
+                  - ec2:DeleteLaunchTemplate
+                  - ec2:DeleteLaunchTemplateVersions
+                  - ec2:RunInstances
+                  - ec2:TerminateInstances
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                  - autoscaling:*
+                  - rds:*
+                  - elasticloadbalancing:*
+                  - elasticfilesystem:*
+                  - elasticache:*
+                  - backup:*
+                  - logs:*
+                  - cloudwatch:*
+                  - cloudfront:*
+                  - wafv2:*
+                  - acm:*
+                  - lambda:CreateFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:InvokeFunction
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:TagResource
+                  - ssm:GetParameters
+                  - ssm:GetParameter
+                Resource: '*'
+              - Sid: S3ScopedToAppStack
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:PutBucketPolicy
+                  - s3:DeleteBucketPolicy
+                  - s3:GetBucketPolicy
+                  - s3:PutBucketAcl
+                  - s3:GetBucketAcl
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutLifecycleConfiguration
+                  - s3:GetLifecycleConfiguration
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:PutBucketTagging
+                  - s3:GetBucketTagging
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${AppStackName}-*
+                  - !Sub arn:aws:s3:::${AppStackName}-*/*
+              - Sid: Route53ScopedToCustomDomainZone
+                Effect: Allow
+                Action:
+                  - route53:GetHostedZone
+                  - route53:ListResourceRecordSets
+                  - route53:ChangeResourceRecordSets
+                Resource:
+                  - !Sub arn:aws:route53:::hostedzone/${Route53HostedZoneId}
+              - Sid: Route53GetChangeIsAccountGlobal
+                Effect: Allow
+                Action: route53:GetChange
+                Resource: '*'
+              # Non-escalating IAM: read, tag, delete, and instance-profile plumbing.
+              - Sid: IamAppRoleLifecycle
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:GetInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:PassRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${EnvironmentName}-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:instance-profile/${EnvironmentName}-*
+              # Anything that grants permissions only works on a role that carries
+              # AppRoleBoundary, which caps what those permissions can ever be.
+              - Sid: IamGrantsOnlyWithinBoundary
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:PutRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:PutRolePermissionsBoundary
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${EnvironmentName}-*
+                Condition:
+                  StringEquals:
+                    iam:PermissionsBoundary: !Ref AppRoleBoundary
+              # Explicit Denies win over the ${EnvironmentName}-* Allows above: this
+              # stack's own roles and policies are off-limits to the pipeline.
+              - Sid: DenyPipelineSelfModification
+                Effect: Deny
+                Action: iam:*
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${EnvironmentName}-pipeline-deploy-role
+                  - !Sub arn:aws:iam::${AWS::AccountId}:policy/${EnvironmentName}-pipeline-*
+              - Sid: DenyBackupRoleChangesExceptPass
+                Effect: Deny
+                NotAction:
+                  - iam:PassRole
+                  - iam:GetRole
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${EnvironmentName}-pipeline-backup-role
+              - Sid: DenyBoundaryRemoval
+                Effect: Deny
+                Action: iam:DeleteRolePermissionsBoundary
+                Resource: '*'
+
+Outputs:
+  DeployRoleArn:
+    Description: Set as the AWS_DEPLOY_ROLE_ARN GitHub secret
+    Value: !GetAtt GitHubActionsDeployRole.Arn
+
+  AppRoleBoundaryArn:
+    Description: Permissions boundary every app-stack role must carry
+    Value: !Ref AppRoleBoundary
+    Export:
+      Name: !Sub ${EnvironmentName}-pipeline-app-role-boundary-arn
+
+  BackupServiceRoleArn:
+    Description: AWS Backup service role used by the app stack's backup selection
+    Value: !GetAtt BackupServiceRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-pipeline-backup-role-arn
