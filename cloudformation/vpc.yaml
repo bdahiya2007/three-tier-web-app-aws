@@ -548,23 +548,127 @@ Resources:
                 - LabelMatchStatement:
                     Scope: LABEL
                     Key: awswaf:managed:aws:core-rule-set:CrossSiteScripting_Body
+                # Prefixes, not CONTAINS: /wp-comments-post.php/wp-json/wp/v2/x would
+                # match CONTAINS. /index.php/... is the plain-permalink form in use.
                 - NotStatement:
                     Statement:
-                      ByteMatchStatement:
-                        SearchString: /wp-json/wp/v2/
-                        FieldToMatch:
-                          UriPath: {}
-                        TextTransformations:
-                          - Priority: 0
-                            Type: NONE
-                        PositionalConstraint: CONTAINS
+                      OrStatement:
+                        Statements:
+                          - ByteMatchStatement:
+                              SearchString: /wp-json/wp/v2/
+                              FieldToMatch:
+                                UriPath: {}
+                              TextTransformations:
+                                - Priority: 0
+                                  Type: NONE
+                              PositionalConstraint: STARTS_WITH
+                          - ByteMatchStatement:
+                              SearchString: /index.php/wp-json/wp/v2/
+                              FieldToMatch:
+                                UriPath: {}
+                              TextTransformations:
+                                - Priority: 0
+                                  Type: NONE
+                              PositionalConstraint: STARTS_WITH
           VisibilityConfig:
             SampledRequestsEnabled: true
             CloudWatchMetricsEnabled: true
             MetricName: !Sub ${EnvironmentName}-waf-xss-body-block
+        # Brute-force guard: per-IP cap on the two login endpoints only.
+        - Name: RateLimitLoginAndXmlRpc
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 100
+              EvaluationWindowSec: 300
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                OrStatement:
+                  Statements:
+                    - ByteMatchStatement:
+                        SearchString: /wp-login.php
+                        FieldToMatch:
+                          UriPath: {}
+                        TextTransformations:
+                          - Priority: 0
+                            Type: LOWERCASE
+                        PositionalConstraint: STARTS_WITH
+                    - ByteMatchStatement:
+                        SearchString: /xmlrpc.php
+                        FieldToMatch:
+                          UriPath: {}
+                        TextTransformations:
+                          - Priority: 0
+                            Type: LOWERCASE
+                        PositionalConstraint: STARTS_WITH
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${EnvironmentName}-waf-login-rate
+        # Count first, not Block: review the WAF logs for false positives on
+        # real traffic before switching OverrideAction to None.
+        - Name: AWS-AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 4
+          OverrideAction:
+            Count: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${EnvironmentName}-waf-bad-inputs
+        - Name: AWS-AWSManagedRulesWordPressRuleSet
+          Priority: 5
+          OverrideAction:
+            Count: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesWordPressRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${EnvironmentName}-waf-wordpress
+        - Name: AWS-AWSManagedRulesPHPRuleSet
+          Priority: 6
+          OverrideAction:
+            Count: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesPHPRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${EnvironmentName}-waf-php
       Tags:
         - Key: Name
           Value: !Sub ${EnvironmentName}-waf
+
+  # WAF requires the aws-waf-logs- name prefix, and us-east-1 for CLOUDFRONT scope.
+  WAFLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub aws-waf-logs-${EnvironmentName}
+      RetentionInDays: !Ref LogRetentionDays
+
+  WAFLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      ResourceArn: !GetAtt WAFWebACL.Arn
+      # Log group ARN without the trailing :* that GetAtt Arn returns.
+      LogDestinationConfigs:
+        - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${WAFLogGroup}
+      # WordPress auth/session cookies would otherwise be logged in full.
+      RedactedFields:
+        - SingleHeader:
+            Name: cookie
+        - SingleHeader:
+            Name: authorization
 
   CustomDomainCertificate:
     Type: AWS::CertificateManager::Certificate
@@ -965,7 +1069,8 @@ Resources:
       PubliclyAccessible: false
       StorageType: gp3
       BackupRetentionPeriod: !Ref DBBackupRetentionPeriod
-      DeletionProtection: false
+      # Stack deletion needs this set to false first (see Deployment.md).
+      DeletionProtection: true
       EnableCloudwatchLogsExports:
         - error
       Tags:
@@ -977,6 +1082,7 @@ Resources:
     # No explicit DependsOn: enforced implicitly via SourceDBInstanceIdentifier.
     Properties:
       SourceDBInstanceIdentifier: !Ref DBInstance
+      DeletionProtection: true
       EngineVersion: !Ref DBEngineVersion
       AllowMajorVersionUpgrade: true
       DBInstanceClass: !Ref DBInstanceClass
