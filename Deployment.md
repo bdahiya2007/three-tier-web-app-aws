@@ -1231,6 +1231,20 @@ Scoped deliberately, not a broad managed policy:
 
 **Residual risk, knowingly accepted:** anyone who can merge to `main` *and* approve the `production` deployment can still change what the app stack does within these limits. That's what the pipeline is for, and branch protection plus the approval gate cover it. The pipeline stack's own changes need your admin credentials.
 
+### First deploy after the move: two failures and a stuck rollback
+
+The first deploy with the new role (re-run after an earlier attempt ran before the pipeline stack existed, so `Fn::ImportValue` failed) hit two problems:
+
+- **`BackupSelection` replacement failed:** "Backup selection with the same selection document already exists". Switching `IamRoleArn` forces a replacement, and CloudFormation creates the new selection *before* deleting the old one. With the same `SelectionName` and contents, AWS Backup rejects it as a duplicate. **Fix:** a new `SelectionName` (`-v2`).
+- **The rollback then failed (`UPDATE_ROLLBACK_FAILED`):** rolling back meant removing the just-added boundary from `CloudWatchAgentRole`/`RdsLogRetentionFunctionRole`, and the deploy role is explicitly denied `iam:DeleteRolePermissionsBoundary`. That's by design, since removing the boundary is how you'd escape it. It also meant the boundary *had* been applied successfully, which confirmed the `iam:PermissionsBoundary` condition works.
+- **Recovery (admin credentials, since the deploy role has no `ContinueUpdateRollback`):**
+  ```bash
+  aws cloudformation continue-update-rollback --stack-name three-tier-app-network --region us-east-1 \
+    --resources-to-skip CloudWatchAgentRole RdsLogRetentionFunctionRole
+  ```
+  Skipping keeps the boundary on both roles, which is safer than removing it. CloudFormation records them as rolled back, and the next deploy re-applies the same boundary as a no-op.
+- **General lesson:** an explicit Deny on an "undo" action also blocks CloudFormation's automatic undo of that change. Any future rollback of a change that *adds* a boundary will need this same admin `continue-update-rollback` step.
+
 ### What `validate.yml` does (pull requests)
 
 1. Checks out the repo.

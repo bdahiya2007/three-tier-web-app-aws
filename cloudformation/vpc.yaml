@@ -1099,7 +1099,9 @@ Resources:
     Properties:
       BackupPlanId: !Ref BackupPlan
       BackupSelection:
-        SelectionName: !Sub ${EnvironmentName}-backup-selection
+        # Renamed with the role move: replacement creates the new selection before
+        # deleting the old, and Backup rejects an identical duplicate.
+        SelectionName: !Sub ${EnvironmentName}-backup-selection-v2
         IamRoleArn:
           Fn::ImportValue: !Sub ${EnvironmentName}-pipeline-backup-role-arn
         Resources:
