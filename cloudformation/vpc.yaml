@@ -1094,6 +1094,14 @@ Resources:
               ));
               DBCONFIGEOF
 
+              # Two Factor lives on EFS, which a stack rebuild recreates empty - install it
+              # here so 2FA survives (the DB snapshot keeps it active and users' settings).
+              if [ ! -d /var/www/html/wp-content/plugins/two-factor ]; then
+                cd /tmp
+                wget -q https://downloads.wordpress.org/plugin/two-factor.zip
+                unzip -q -o two-factor.zip -d /var/www/html/wp-content/plugins/
+              fi
+
               cd /tmp
               wget -q https://downloads.wordpress.org/plugin/redis-cache.zip
               unzip -q -o redis-cache.zip
