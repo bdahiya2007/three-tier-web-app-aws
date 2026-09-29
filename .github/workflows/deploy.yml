@@ -53,16 +53,29 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Validate CloudFormation template
+      # Templates go via S3 (TemplateURL, 1 MB limit) instead of inline
+      # TemplateBody (51,200 bytes, which this template outgrew). The bucket
+      # is the stack's own CfnArtifactsBucket.
+      - name: Upload and validate CloudFormation template
         run: |
+          bucket=$(aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query "Stacks[0].Outputs[?OutputKey=='CfnArtifactsBucketName'].OutputValue" \
+            --output text)
+          test -n "$bucket" && test "$bucket" != "None"
+          echo "ARTIFACTS_BUCKET=$bucket" >> "$GITHUB_ENV"
+          key="validate/${{ github.sha }}.yaml"
+          aws s3 cp ${{ env.TEMPLATE_FILE }} "s3://$bucket/$key" --region ${{ env.AWS_REGION }}
           aws cloudformation validate-template \
-            --template-body file://${{ env.TEMPLATE_FILE }} \
+            --template-url "https://$bucket.s3.amazonaws.com/$key" \
             --region ${{ env.AWS_REGION }}
 
       - name: Deploy CloudFormation stack
         run: |
           aws cloudformation deploy \
             --template-file ${{ env.TEMPLATE_FILE }} \
+            --s3-bucket "$ARTIFACTS_BUCKET" \
             --stack-name ${{ env.STACK_NAME }} \
             --region ${{ env.AWS_REGION }} \
             --capabilities CAPABILITY_NAMED_IAM \
