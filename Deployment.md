@@ -374,6 +374,20 @@ Three log sources are configured, landing in two different places:
 | Each instance's `cloud-init-output.log` (the `UserData` bootstrap script's full output — the same thing we've been reading over SSH all along) | CloudWatch Logs, log group `/<EnvironmentName>/cloud-init-output` | `LogRetentionDays` (default 7) |
 | RDS error log | CloudWatch Logs, log group `/aws/rds/instance/<db-instance-identifier>/error` | `LogRetentionDays` (default 7), set via a Lambda-backed custom resource (`DBErrorLogRetention`) rather than a plain `AWS::Logs::LogGroup` — see "Why does the RDS error log group need a custom resource for retention?" in Troubleshooting for why. |
 
+### The DB password used to leak into the cloud-init log
+
+`UserData` runs under `#!/bin/bash -xe`, and `-x` echoes every command before running it — including the `sed` lines that write `DBName`/`DBUsername`/`DBPassword` into `wp-config.php`. Since `cloud-init-output.log` is shipped to CloudWatch Logs, **the DB master password was readable in plaintext by anyone with `logs:GetLogEvents`/`FilterLogEvents`** on that log group (which includes `GitHubActionsDeployRole`'s `logs:*`). Found during a security review by counting matches without printing them:
+
+```bash
+aws logs filter-log-events --log-group-name /<EnvironmentName>/cloud-init-output --region us-east-1 \
+  --filter-pattern '"password_here"' --query 'length(events)' --output text
+# any non-zero line = a leaked password line exists (output is per page, so several numbers may print)
+```
+
+Fixed by wrapping those `sed` lines in `set +x` / `set -x`. The `db-config.php` heredoc was never affected — `-x` traces the `cat` command but not the heredoc body. The fix only prevents *new* leaks: log events already written stay until their retention expires, so after deploying it, delete the old log streams and rotate `DBPassword` (it must be treated as exposed).
+
+Still open by design: the password remains in plaintext in the launch template's `UserData` (readable with `ec2:DescribeLaunchTemplateVersions` / `DescribeInstanceAttribute`) and in `wp-config.php`/`db-config.php` on each instance. Closing that needs a runtime secret fetch (Secrets Manager or SSM SecureString) — the tradeoff deliberately not taken so far (see the W1011 note in Troubleshooting).
+
 ### Change the retention period
 
 All four sources share one parameter, `LogRetentionDays` (default `7`). To change it for all of them at once:

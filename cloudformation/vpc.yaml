@@ -855,9 +855,13 @@ Resources:
               cd /var/www/html
               cp wp-config-sample.php wp-config.php
 
+              # Tracing off: -x would echo these credentials into cloud-init-output.log,
+              # which the CloudWatch agent ships to CloudInitLogGroup.
+              set +x
               sed -i "s/database_name_here/${DBName}/" wp-config.php
               sed -i "s/username_here/${DBUsername}/" wp-config.php
               sed -i "s/password_here/${DBPassword}/" wp-config.php
+              set -x
               sed -i "s/localhost/${DBInstance.Endpoint.Address}/" wp-config.php
 
               # Redundant now the ALB origin is HTTPS, kept as a defensive fallback.

@@ -218,9 +218,12 @@ resource "aws_instance" "wordpress" {
     cd /var/www/html
     cp wp-config-sample.php wp-config.php
 
+    # Tracing off: -x would echo these credentials into cloud-init-output.log.
+    set +x
     sed -i "s/database_name_here/${var.db_name}/" wp-config.php
     sed -i "s/username_here/${var.db_username}/" wp-config.php
     sed -i "s/password_here/${var.db_password}/" wp-config.php
+    set -x
     sed -i "s/localhost/${aws_db_instance.main.address}/" wp-config.php
 
     chown -R apache:apache /var/www/html
