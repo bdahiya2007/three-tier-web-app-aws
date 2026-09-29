@@ -29,7 +29,6 @@ A production-style three-tier web architecture on AWS — WordPress running behi
 - Enforcing the branch/PR policy at the platform level, not just by convention: a branch protection rule on `main` rejects direct pushes outright and requires the CI lint check to pass and the branch to be up to date before merge is even possible — configured to still let a solo maintainer merge their own reviewed PRs (`required_approving_review_count: 0`) rather than accidentally locking the repo owner out
 - A second, stack-wide security review that found issues hiding in plain sight: the DB master password was being written to CloudWatch Logs by `bash -x` tracing in `UserData` (confirmed by counting matching log events, never printing them), and the CI deploy role could grant *itself* admin, because a role that deploys its own permissions can always escalate them. Fixed the second one structurally rather than with tighter conditions: the role moved to a separate, manually deployed stack with an explicit self-Deny, and a permissions boundary caps every role it can grant to
 - Outgrowing CloudFormation's 51,200-byte inline template limit (hit twice: a 3-line fix passed `cfn-lint`, merged, then failed on deploy) and fixing it properly: deploys now go through a stack-owned S3 bucket (1 MB limit), with a PR-time size check so the next overflow fails before merge, not after
-- Keeping the blog's content in git so it survives losing the AWS account, not just the database: a weekly workflow exports published posts, pages, media and site-editor customizations through the WordPress REST API, and opens a PR when anything changed. A restore script rebuilds everything on any WordPress site, remapping media IDs and URLs. A CI job proves the round trip on two real, throwaway WordPress sites. Getting authentication through meant finding that Apache (no `.htaccess` under plain permalinks) and CloudFront (GET requests) were each dropping the `Authorization` header
 - Documenting every failure encountered as it happened — root cause and fix, not just the happy path — in [Deployment.md](Deployment.md)
 
 ## Architecture
@@ -128,7 +127,6 @@ flowchart LR
 | Deploys will upload the template to an S3 bucket the stack owns (`CfnArtifactsBucket`) instead of sending it inline | Inline `TemplateBody` is capped at 51,200 bytes, and this template reached that limit twice. The bucket is part of the stack and auto-named inside the deploy role's existing S3 scope, so the role only needed object-level permissions added, not access to anything new |
 | The CI deploy role lives in its own manually deployed stack (`pipeline.yaml`), not in the stack it deploys | A role that deploys its own permissions can always escalate them. Moving it out, adding an explicit self-Deny, and requiring a permissions boundary on every role it grants to means a compromised workflow run is capped at the app's own permissions, not account admin |
 | DB password read from Secrets Manager at runtime (1-minute refresh timer), not baked into `UserData` | A security review found the password in CloudWatch Logs and in every launch template version. A runtime fetch removes it from both, and the refresh timer means a rotation reaches running instances in about a minute instead of needing a 20-minute rolling replacement. The secret was seeded with the existing password first, so the switch itself caused no downtime |
-| Blog content backed up to this repo (public content only), with AWS Backup kept as the first line of defence | AWS Backup and RDS snapshots can't outlive the AWS account they're in. A git copy can, and restores onto any host. The repo is public, so the export deliberately excludes users, comments, drafts and any database dump |
 | `DBPassword`'s `AllowedPattern` excluded `'` and `\`, not just `/`, `@`, `"`, and whitespace (the parameter has since been removed: the generated password in Secrets Manager excludes the same characters) | Found during a security review: `db-config.php` embeds the password inside a single-quoted PHP string literal, so an unescaped `'` in a chosen password would cause a fatal PHP parse error on every instance boot — a self-inflicted outage from an otherwise-valid password. The older `wp-config.php` `sed` substitution wasn't vulnerable to this specific character |
 
 ## Security review
@@ -169,10 +167,7 @@ Full methodology (exact commands, the counter values, the `read_only` proof) is 
 │   └── pipeline.yaml             # GitHub OIDC deploy role, Backup service role, permissions boundary
 │                                  # (deployed manually by an admin, never by CI)
 ├── terraform/                    # Earlier, simpler baseline (see note below) — not feature-equivalent
-├── .github/workflows/            # deploy (OIDC, push to main), validate (PR lint), content-backup (weekly),
-│                                  # content-tools-test (export/restore round trip on real WordPress)
-├── scripts/wp_content.py         # Export published blog content to content/, restore it into any WordPress
-├── content/                      # Blog content backup (generated; public content only)
+├── .github/workflows/deploy.yml  # CI/CD: GitHub OIDC authentication, deploy on push to main
 ├── Deployment.md                 # Full deployment guide, every parameter, and an extensive
 │                                  # troubleshooting log of every real failure hit building this
 └── .gitignore
@@ -184,7 +179,7 @@ It's an earlier, deliberately simpler snapshot of this project — a VPC, a sing
 
 ## CI/CD pipeline
 
-Two infrastructure workflows, split by trigger — each with its own concurrency scope, so a PR's lint check never has to queue behind an in-progress production deploy (plus two for the blog content backup, below):
+Two separate workflows, split by trigger — each with its own concurrency scope, so a PR's lint check never has to queue behind an in-progress production deploy:
 
 - [`.github/workflows/validate.yml`](.github/workflows/validate.yml) — every pull request targeting `main`. Lints the CloudFormation template with `cfn-lint` and fails if it exceeds CloudFormation's 1 MB template limit (which `cfn-lint` doesn't check). No AWS credentials at all.
 - [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) — every push to `main` (i.e. after a PR merges). Requests a short-lived GitHub OIDC token, assumes `GitHubActionsDeployRole` (no `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` anywhere in this repo), uploads the template to the stack's own S3 bucket (templates passed inline are capped at 51,200 bytes, which this one outgrew), validates and deploys the stack from there (`KeyPairName` from GitHub Secrets; the DB password is generated in Secrets Manager and never passes through CI; every other parameter keeps its current value), then prints the stack outputs.
