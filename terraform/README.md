@@ -10,7 +10,7 @@ Assumes Terraform >= 1.5 and AWS credentials configured (`aws configure` or an a
 
 `db_password` and `key_pair_name` have no defaults and must be supplied on every `plan`/`apply`.
 
-- `db_password` — 8-41 characters, no `/`, `@`, `"`, or spaces.
+- `db_password` — 8-41 characters, no `/`, `@`, `"`, or spaces. The `user_data` script turns off shell tracing (`set +x`) around the lines that write it into `wp-config.php`, so it doesn't end up in `/var/log/cloud-init-output.log`. It's still visible in the instance's user data, though.
 - `key_pair_name` — name of an EC2 key pair that already exists in `us-east-1`.
 
 ### Create a key pair
