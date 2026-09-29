@@ -244,6 +244,24 @@ Resources:
                 Effect: Allow
                 Action: route53:GetChange
                 Resource: '*'
+              # App secrets only (DB master password, CloudFront origin-verify header).
+              - Sid: SecretsManagerAppSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:TagResource
+                  - secretsmanager:UntagResource
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${EnvironmentName}-*
+              # Used by GenerateSecretString; has no resource-level scoping.
+              - Sid: SecretsManagerRandomPassword
+                Effect: Allow
+                Action: secretsmanager:GetRandomPassword
+                Resource: '*'
               # Non-escalating IAM: read, tag, delete, and instance-profile plumbing.
               - Sid: IamAppRoleLifecycle
                 Effect: Allow

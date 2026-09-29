@@ -59,7 +59,8 @@ Parameters:
 
   DBPassword:
     Type: String
-    # ' and \ excluded: db-config.php embeds this in a single-quoted PHP string
+    # ' and \ excluded: embedded in a single-quoted PHP string (and JSON).
+    # Only seeds DBMasterSecret now; instances read the secret, not this.
     Description: RDS master password (8-41 chars, no / @ " ' \ spaces)
     NoEcho: true
     MinLength: 8
@@ -295,6 +296,26 @@ Resources:
     Properties:
       SubnetId: !Ref PrivateSubnet2
       RouteTableId: !Ref PrivateRouteTable
+
+  # Seeded from DBPassword so this first switch changes nothing; rotating to a
+  # generated value is a separate, later step (see Deployment.md).
+  DBMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${EnvironmentName}-db-master
+      Description: RDS master credentials; WordPress instances read this at runtime.
+      SecretString: !Sub '{"username":"${DBUsername}","password":"${DBPassword}"}'
+
+  # Sent by CloudFront as X-Origin-Verify, so the ALB can reject requests that
+  # came through any other CloudFront distribution.
+  OriginVerifySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${EnvironmentName}-origin-verify
+      Description: Shared secret header between CloudFront and the ALB.
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
 
   DBSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
@@ -696,6 +717,9 @@ Resources:
         Origins:
           - Id: ALBOrigin
             DomainName: !GetAtt ApplicationLoadBalancer.DNSName
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Sub '{{resolve:secretsmanager:${OriginVerifySecret}}}'
             CustomOriginConfig:
               OriginProtocolPolicy: https-only
               HTTPPort: 80
@@ -836,6 +860,14 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub ${EnvironmentName}-cw-agent-role
+      Policies:
+        - PolicyName: ReadDBMasterSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DBMasterSecret
       # Required: the deploy role can only grant permissions within this boundary.
       PermissionsBoundary:
         Fn::ImportValue: !Sub ${EnvironmentName}-pipeline-app-role-boundary-arn
@@ -935,13 +967,47 @@ Resources:
               cd /var/www/html
               cp wp-config-sample.php wp-config.php
 
-              # Tracing off: -x would echo these credentials into cloud-init-output.log,
-              # which the CloudWatch agent ships to CloudInitLogGroup.
-              set +x
+              # The DB password never appears in UserData: this script fetches it
+              # from Secrets Manager into a PHP file outside the web root, and a
+              # 1-minute timer re-runs it so a rotated password is picked up
+              # without replacing instances. Output is never echoed (-x safe).
+              mkdir -p /etc/wordpress
+              cat > /usr/local/bin/refresh-db-secret <<'REFRESHEOF'
+              #!/bin/bash
+              set -euo pipefail
+              pw=$(aws secretsmanager get-secret-value --region ${AWS::Region} \
+                --secret-id ${DBMasterSecret} --query SecretString --output text \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
+              tmp=$(mktemp /etc/wordpress/.db-secret.XXXXXX)
+              printf "<?php define( 'DB_PASSWORD', '%s' );\n" "$pw" > "$tmp"
+              chown root:apache "$tmp"; chmod 640 "$tmp"
+              mv -f "$tmp" /etc/wordpress/db-secret.php
+              REFRESHEOF
+              chmod 755 /usr/local/bin/refresh-db-secret
+              /usr/local/bin/refresh-db-secret
+
+              cat > /etc/systemd/system/refresh-db-secret.service <<'UNITEOF'
+              [Unit]
+              Description=Refresh WordPress DB password from Secrets Manager
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/local/bin/refresh-db-secret
+              UNITEOF
+              cat > /etc/systemd/system/refresh-db-secret.timer <<'UNITEOF'
+              [Unit]
+              Description=Refresh WordPress DB password every minute
+              [Timer]
+              OnBootSec=1min
+              OnUnitActiveSec=1min
+              [Install]
+              WantedBy=timers.target
+              UNITEOF
+              systemctl daemon-reload
+              systemctl enable --now refresh-db-secret.timer
+
               sed -i "s/database_name_here/${DBName}/" wp-config.php
               sed -i "s/username_here/${DBUsername}/" wp-config.php
-              sed -i "s/password_here/${DBPassword}/" wp-config.php
-              set -x
+              sed -i "/'DB_PASSWORD'/c\\require '/etc/wordpress/db-secret.php';" wp-config.php
               sed -i "s/localhost/${DBInstance.Endpoint.Address}/" wp-config.php
 
               # Redundant now the ALB origin is HTTPS, kept as a defensive fallback.
@@ -976,7 +1042,7 @@ Resources:
               \$wpdb->add_database(array(
                   'host'     => '${DBInstance.Endpoint.Address}',
                   'user'     => '${DBUsername}',
-                  'password' => '${DBPassword}',
+                  'password' => DB_PASSWORD,
                   'name'     => '${DBName}',
                   'write'    => 1,
                   'read'     => 0,
@@ -987,7 +1053,7 @@ Resources:
               \$wpdb->add_database(array(
                   'host'     => '${DBReadReplica.Endpoint.Address}',
                   'user'     => '${DBUsername}',
-                  'password' => '${DBPassword}',
+                  'password' => DB_PASSWORD,
                   'name'     => '${DBName}',
                   'write'    => 0,
                   'read'     => 1,
@@ -1045,12 +1111,6 @@ Resources:
     Type: AWS::RDS::DBInstance
     DeletionPolicy: Snapshot
     UpdateReplacePolicy: Snapshot
-    # cfn-lint W1011 suppressed: Secrets Manager isn't needed at this scale.
-    Metadata:
-      cfn-lint:
-        config:
-          ignore_checks:
-            - W1011
     Properties:
       DBName: !If [RestoreFromSnapshot, !Ref 'AWS::NoValue', !Ref DBName]
       Engine: mysql
@@ -1059,7 +1119,7 @@ Resources:
       DBInstanceClass: !Ref DBInstanceClass
       AllocatedStorage: !Ref DBAllocatedStorage
       MasterUsername: !Ref DBUsername
-      MasterUserPassword: !Ref DBPassword
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBMasterSecret}:SecretString:password}}'
       DBSnapshotIdentifier: !If [RestoreFromSnapshot, !Ref DBSnapshotIdentifier, !Ref 'AWS::NoValue']
       DBSubnetGroupName: !Ref DBSubnetGroup
       VPCSecurityGroups:

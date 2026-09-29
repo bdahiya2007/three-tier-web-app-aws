@@ -399,7 +399,7 @@ aws logs filter-log-events --log-group-name /<EnvironmentName>/cloud-init-output
 
 Fixed by wrapping those `sed` lines in `set +x` / `set -x`. The `db-config.php` heredoc was never affected — `-x` traces the `cat` command but not the heredoc body. The fix only prevents *new* leaks: log events already written stay until their retention expires, so after deploying it, delete the old log streams and rotate `DBPassword` (it must be treated as exposed).
 
-Still open by design: the password remains in plaintext in the launch template's `UserData` (readable with `ec2:DescribeLaunchTemplateVersions` / `DescribeInstanceAttribute`) and in `wp-config.php`/`db-config.php` on each instance. Closing that needs a runtime secret fetch (Secrets Manager or SSM SecureString) — the tradeoff deliberately not taken so far (see the W1011 note in Troubleshooting).
+**Follow-up:** the password is no longer in `UserData` at all. Instances now read it from Secrets Manager at runtime; see "DB password in Secrets Manager" below. That closes the launch-template exposure for new launch template versions. Older versions still hold the old password until it's rotated, which is the next step.
 
 ### Change the retention period
 
@@ -846,9 +846,9 @@ Found during security architect reviews (the first for this feature; a second, s
 
 - **Neither RDS instance is encrypted at rest** (`StorageEncrypted: false` on both). Check with `aws rds describe-db-instances --query "DBInstances[].[DBInstanceIdentifier,StorageEncrypted]"`. This predates the replica, but a read replica must match its source's encryption status — so adding the replica locked this gap into two instances instead of one. Remediation requires snapshot → restore-as-encrypted for the primary (a genuinely disruptive operation — new endpoint, same complexity class as the earlier snapshot-restore work in this file), then recreating the replica from the now-encrypted primary.
 - **No TLS enforcement in transit** between the web tier and either RDS instance (`require_secure_transport` unset, using the MySQL engine default). Check with `aws rds describe-db-parameters --db-parameter-group-name <group> --query "Parameters[?ParameterName=='require_secure_transport']"`. Partially mitigated by VPC-level network isolation (unreachable from outside the VPC regardless), but doesn't meet defense-in-depth for data-in-transit on its own. Lower-risk to remediate than the encryption gap — a parameter group change plus adding SSL context to the MySQL/HyperDB connections, no instance replacement needed.
-- **The DB master password is still plaintext in the launch template's `UserData`** (every version), readable by anyone with `ec2:DescribeLaunchTemplateVersions`, and in `wp-config.php`/`db-config.php` on each instance. The CloudWatch Logs leak is fixed (see "The DB password used to leak into the cloud-init log"), but the password itself must be treated as exposed until rotated. **Planned:** move it to Secrets Manager, fetched at boot through the instance role, which also generates a new password.
+- **The DB master password hasn't been rotated yet.** It's now held in Secrets Manager and no longer in `UserData`, but it's still the value that leaked to CloudWatch Logs and that older launch template versions contain. **Planned:** generate a new random password in the secret and RDS; instances pick it up within a minute (see "DB password in Secrets Manager").
 - **Redis has no encryption in transit, at rest, or AUTH token** (`describe-cache-clusters`: `TransitEncryptionEnabled`/`AtRestEncryptionEnabled`/`AuthTokenEnabled` all `false`). Only `RedisSecurityGroup` protects it. **Planned:** an encrypted `ReplicationGroup` with TLS and an AUTH token. At-rest encryption can't be enabled on a `CacheCluster`.
-- **The ALB accepts any CloudFront distribution, not just this one.** The origin-facing prefix list covers all of CloudFront, so someone else's distribution pointed at the ALB could bypass this stack's WAF. **Planned:** a secret custom origin header from CloudFront, with the ALB listener returning a fixed 403 without it.
+- **The ALB accepts any CloudFront distribution, not just this one.** The origin-facing prefix list covers all of CloudFront, so someone else's distribution pointed at the ALB could bypass this stack's WAF. **In progress:** CloudFront now sends a secret `X-Origin-Verify` header, stored in Secrets Manager as `three-tier-app-origin-verify`. The next step makes the ALB listener reject requests without it (fixed 403). That has to be a separate deploy, after CloudFront is already sending the header, or the site would go down.
 - **No Multi-AZ** on the RDS primary (roughly doubles RDS cost). Deletion protection is now on for both instances.
 - **WordPress connects as the RDS master user**, not a least-privilege application user.
 - **Smaller hardening items:** no explicit `MetadataOptions` (IMDSv2 is enforced today only by the AL2023 AMI default), plain HTTP on the in-VPC ALB→instance hop, unpinned WordPress/plugin downloads with no checksum, `chmod -R 755` leaving config files world-readable, no CloudFront security-headers policy, no `aws:SecureTransport` deny on the ALB logs bucket, GitHub Actions pinned by tag rather than SHA, and `DB_PASSWORD` interpolated straight into a `run:` shell line.
@@ -954,6 +954,36 @@ Live result from this exact test: an on-demand EFS backup completed in well unde
 ### Restoring from a recovery point
 
 Not exercised end-to-end here (would mean actually restoring over live infrastructure), but the mechanism: `aws backup start-restore-job --recovery-point-arn <arn> --iam-role-arn <backup-role-arn> --metadata <resource-specific-metadata> --region us-east-1`. RDS and EFS restores create a **new** resource (a new DB instance, a new file system) rather than overwriting the original in place — the same principle as the RDS snapshot-restore path already documented above, and worth remembering before assuming "restore" means "revert this exact resource."
+
+## DB password in Secrets Manager
+
+The RDS master password lives in the Secrets Manager secret **`three-tier-app-db-master`** (`{"username": ..., "password": ...}`). It's no longer in `UserData`, the launch template, `wp-config.php` or `db-config.php`:
+
+- **RDS** reads it with a dynamic reference: `MasterUserPassword: '{{resolve:secretsmanager:<secret>:SecretString:password}}'`.
+- **Instances** fetch it at boot. `/usr/local/bin/refresh-db-secret` writes `/etc/wordpress/db-secret.php` (`define('DB_PASSWORD', ...)`) outside the web root, owned `root:apache`, mode `640`, via an atomic temp-file-and-rename. `wp-config.php` `require`s that file, and HyperDB's `db-config.php` uses the `DB_PASSWORD` constant for both the primary and the replica.
+- **A systemd timer (`refresh-db-secret.timer`) re-runs it every minute.** A rotated password is picked up within about a minute, with no instance replacement. PHP's opcache re-checks included files' timestamps by default, so no restart is needed either.
+- The instance role (`three-tier-app-cw-agent-role`) gets `secretsmanager:GetSecretValue` on this one secret. That's within `AppRoleBoundary`, which already allowed `three-tier-app-*` secrets.
+- The script never echoes the value, so `bash -x` tracing in `UserData` only shows the command name.
+
+**Migration without downtime:** the secret was first **seeded with the existing `DBPassword` value**, so switching RDS and the instances to it changed nothing. Rotating to a new random value is a separate step. Doing both at once would have changed the RDS password while the old instances (being replaced one at a time over about 20 minutes) still had the old one baked in.
+
+**Deploy order for this change:** the deploy role needed new `secretsmanager` permissions in `pipeline.yaml`. That stack is admin-deployed, so redeploy it **before** merging an app-stack change that adds secrets:
+
+```bash
+aws cloudformation deploy --template-file cloudformation/pipeline.yaml --stack-name three-tier-app-pipeline \
+  --region us-east-1 --capabilities CAPABILITY_NAMED_IAM
+```
+
+**Verify on an instance:**
+
+```bash
+systemctl list-timers refresh-db-secret.timer        # next/last run
+sudo ls -l /etc/wordpress/db-secret.php               # -rw-r----- root apache
+sudo journalctl -u refresh-db-secret --since -10min   # should show successful runs, never the value
+grep -n "DB_PASSWORD\|db-secret" /var/www/html/wp-config.php   # only the require line
+```
+
+**Cost:** $0.40/month per secret (two: this one and `three-tier-app-origin-verify`), plus $0.05 per 10,000 API calls. The 1-minute timer on 2–3 instances makes about 130k calls a month, roughly $0.65/month.
 
 ## Troubleshooting
 
@@ -1075,7 +1105,7 @@ Every issue actually hit while building and operating this stack, with symptom �
 ### cfn-lint W3005 / W1011 findings on pull requests
 
 - **W3005** ("`'<X>'` dependency already enforced by a `'Ref'`/`'GetAtt'` at ...") fires whenever a resource has both an explicit `DependsOn` entry *and* a `Ref`/`Fn::GetAtt` reference to that same resource elsewhere in its properties (or, for `WebServerLaunchTemplate`, inside its `UserData` string) — the explicit entry is redundant, since CloudFormation already infers the dependency from the reference. Hit this repeatedly (`DBInstance`, `DBReadReplica`, `HttpdErrorLogGroup`, `CloudInitLogGroup` in various resources' `DependsOn` lists) — the fix each time was simply removing the redundant entry, not adding a suppression. Only keep an explicit `DependsOn` for a resource that's genuinely *not* referenced anywhere in that resource's properties (e.g. `EFSMountTarget1`/`EFSMountTarget2` on `WebServerLaunchTemplate` — nothing in `UserData` references them directly, only `EFSFileSystem`, so their dependency has to stay explicit).
-- **W1011** ("Use dynamic references over parameters for secrets") fires on `MasterUserPassword: !Ref DBPassword` in `DBInstance`, suggesting an AWS Secrets Manager dynamic reference instead of a plain `NoEcho` parameter. This one is **deliberately suppressed** (via a per-resource `Metadata: cfn-lint: config: ignore_checks: [W1011]` block on `DBInstance`), not fixed — see the cost/complexity discussion earlier in this file about why GitHub Secrets was chosen over Secrets Manager for this project's scale. Don't "fix" this by actually migrating to Secrets Manager without re-deciding that tradeoff first; the suppression exists precisely because the finding is correct advice being knowingly not taken here.
+- **W1011** ("Use dynamic references over parameters for secrets") fired on `MasterUserPassword: !Ref DBPassword` in `DBInstance`, suggesting an AWS Secrets Manager dynamic reference instead of a plain `NoEcho` parameter. For a long time it was **deliberately suppressed** (a per-resource `Metadata: cfn-lint: config: ignore_checks: [W1011]` block), since GitHub Secrets seemed enough at this scale. **That decision was reversed** after a security review found the password in CloudWatch Logs and in every launch template version. `MasterUserPassword` now uses `{{resolve:secretsmanager:...}}` and the suppression is gone. See "DB password in Secrets Manager".
 - **Exit codes**: `cfn-lint` returns non-zero for warnings, not just errors — a bare `cfn-lint template.yaml` failing doesn't necessarily mean anything is actually broken, just that it found something to flag. Read the actual finding before assuming the template is wrong.
 
 ### Why does the RDS error log group need a custom resource for retention?
@@ -1289,6 +1319,7 @@ Scoped deliberately, not a broad managed policy:
 - **CloudFormation** actions restricted to this one stack's ARN (`stack/three-tier-app-network/*`); `ValidateTemplate` is separate since that action has no resource-level permission support.
 - **EC2, Auto Scaling, RDS, ELBv2, EFS, ElastiCache, AWS Backup, Logs, CloudWatch, Lambda, SSM, CloudFront, WAFv2, ACM**: action list scoped to only what a deploy needs (not `service:*` wildcards, except where AWS groups related actions like `autoscaling:*`/`rds:*`/`elasticfilesystem:*`/`elasticache:*`/`backup:*`/`cloudfront:*`/`wafv2:*`/`acm:*` themselves) — but on `Resource: "*"`, since most of these create/describe/modify actions genuinely don't support resource-level ARN restriction in AWS's own IAM implementation (a documented AWS limitation, not a shortcut here). ACM specifically has no such restriction to apply anyway: a certificate's ARN doesn't exist yet at policy-write time, and DNS-validated certs are typically single-use per domain.
 - **Route 53**: restricted to the one hosted zone this stack adds a record into (`arn:aws:route53:::hostedzone/<id>`), not `route53:*` on every zone in the account — unlike most of the list above, Route 53 record actions genuinely do support resource-level ARN restriction, so there was no reason not to use it. `route53:GetChange` is the one exception (`Resource: "*"`) since change IDs aren't scoped to a zone.
+- **Secrets Manager**: create, read, update and delete only on `secret:three-tier-app-*` (the DB master secret and the origin-verify secret). `GetRandomPassword` (used by `GenerateSecretString`) is `Resource: "*"` because it has no resource-level scoping. The deploy role needs `GetSecretValue` because CloudFormation resolves `{{resolve:secretsmanager:...}}` references with the caller's credentials.
 - **S3**: restricted to bucket names starting with `three-tier-app-network-` (this stack's naming convention for the ALB logs bucket).
 - **IAM**: the tightest of all, since over-broad IAM permissions on a CI role are a privilege-escalation risk. See the next section.
 
