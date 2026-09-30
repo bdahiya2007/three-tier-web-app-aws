@@ -894,7 +894,7 @@ Found during security architect reviews (the first for this feature; a second, s
 
 - **Neither RDS instance is encrypted at rest** (`StorageEncrypted: false` on both). Check with `aws rds describe-db-instances --query "DBInstances[].[DBInstanceIdentifier,StorageEncrypted]"`. This predates the replica, but a read replica must match its source's encryption status — so adding the replica locked this gap into two instances instead of one. Remediation requires snapshot → restore-as-encrypted for the primary (a genuinely disruptive operation — new endpoint, same complexity class as the earlier snapshot-restore work in this file), then recreating the replica from the now-encrypted primary.
 - **No TLS enforcement in transit** between the web tier and either RDS instance (`require_secure_transport` unset, using the MySQL engine default). Check with `aws rds describe-db-parameters --db-parameter-group-name <group> --query "Parameters[?ParameterName=='require_secure_transport']"`. Partially mitigated by VPC-level network isolation (unreachable from outside the VPC regardless), but doesn't meet defense-in-depth for data-in-transit on its own. Lower-risk to remediate than the encryption gap — a parameter group change plus adding SSL context to the MySQL/HyperDB connections, no instance replacement needed.
-- **Redis has no encryption in transit, at rest, or AUTH token** (`describe-cache-clusters`: `TransitEncryptionEnabled`/`AtRestEncryptionEnabled`/`AuthTokenEnabled` all `false`). Only `RedisSecurityGroup` protects it. **Planned:** an encrypted `ReplicationGroup` with TLS and an AUTH token. At-rest encryption can't be enabled on a `CacheCluster`.
+- ~~**Redis has no encryption in transit, at rest, or AUTH token**~~ — **FIXED**: `RedisReplicationGroup` (TLS + AUTH token, see "Redis object cache" below).
 - **No Multi-AZ** on the RDS primary (roughly doubles RDS cost). Deletion protection is now on for both instances.
 - **WordPress connects as the RDS master user**, not a least-privilege application user.
 - **Three WAF managed rule groups are still in Count mode** (`KnownBadInputs`, `WordPress`, `PHP`): they log matches but don't block yet. They switch to Block once the WAF logs show no false positives on real traffic (see "WAF logs and promoting Count rules to Block").
@@ -911,15 +911,19 @@ Same rule as any other `UserData` change: a stack update alone doesn't touch alr
 
 ## Redis object cache (ElastiCache)
 
-`RedisCluster` is a single-node ElastiCache Redis cluster (`RedisNodeType`, default `cache.t3.micro` — eligible for the ElastiCache free tier) in the private subnets, reachable only from `WebServerSecurityGroup` on port 6379 (`RedisSecurityGroup`). No Multi-AZ, no encryption, no snapshot policy — the same single-node simplicity tradeoff as the RDS primary, and unlike RDS, cache data is inherently disposable (rebuilt from the database on the next read), so there's nothing worth preserving through a node failure or stack teardown.
+`RedisReplicationGroup` is a single-node ElastiCache Redis **replication group** (`NumCacheClusters: 1`, `AutomaticFailoverEnabled: false` — a primary with no read replica; see the encryption note below for why this is a `ReplicationGroup` rather than a plain `CacheCluster`) with `RedisNodeType`, default `cache.t3.micro` — eligible for the ElastiCache free tier, in the private subnets, reachable only from `WebServerSecurityGroup` on port 6379 (`RedisSecurityGroup`). No Multi-AZ, no snapshot policy — cache data is inherently disposable (rebuilt from the database on the next read), so there's nothing worth preserving through a node failure or stack teardown.
 
-**Cost added**: `cache.t3.micro` is $0.014/hour on-demand in `us-east-1` (verified via `aws pricing get-products`), roughly ~$10/month — free for the first 12 months on an eligible new AWS account under ElastiCache's free tier (750 node-hours/month), which covers this single node's usage entirely as long as nothing else in the account is also consuming that same free tier allowance. Brings the running total from the earlier ~$57-61/month estimate to roughly **$67-71/month** (or ~$57-61/month if still within the ElastiCache free tier).
+**Encryption in transit + at rest + AUTH token** (fixed a prior known gap): `TransitEncryptionEnabled`/`AtRestEncryptionEnabled: true`, plus an `AuthToken` generated into `RedisAuthSecret` (Secrets Manager), refreshed onto instances every minute by a `refresh-redis-secret` systemd timer — the same pattern already used for the DB master password, so a rotated token doesn't require replacing instances. WordPress's `wp-config.php` gets `WP_REDIS_SCHEME => 'tls'` plus the token via `require '/etc/wordpress/redis-secret.php'`.
+
+**Why this is `AWS::ElastiCache::ReplicationGroup`, not `AWS::ElastiCache::CacheCluster`**: `AuthToken`/`AtRestEncryptionEnabled`/`TransitEncryptionEnabled` aren't valid properties on `CacheCluster` at all — confirmed live, CloudFormation rejects them outright (`extraneous key [AuthToken] is not permitted`). Those properties only exist on `ReplicationGroup`, even for a single node with no replica. A second gotcha along the way: `ReplicationGroup`'s `AutomaticFailoverEnabled` effectively defaults to `true` in practice (despite the CFN resource schema listing `false`), which fails outright with `NumCacheClusters: 1` (`"When using automatic failover, there must be at least 2 cache clusters"`) — it has to be explicitly set to `false` for a single-node cache like this one.
+
+**Cost**: unchanged — same engine (Redis, not Valkey), same node type, same free-tier eligibility as before. `cache.t3.micro` is $0.014/hour on-demand in `us-east-1` (verified via `aws pricing get-products`), roughly ~$10/month — free for the first 12 months on an eligible new AWS account under ElastiCache's free tier (750 node-hours/month). Also checked Cost Explorer and the AWS Pricing API for an ElastiCache "Extended Support" surcharge (the same mechanism behind the RDS MySQL 8.0 bill) — none exists for ElastiCache in this account/region, and `7.1` (already in use) is the latest available Redis engine version, so there's no Extended Support exposure here either way.
 
 WordPress has no built-in object cache backend beyond a per-request in-memory array. `UserData` installs the [Redis Object Cache](https://wordpress.org/plugins/redis-cache/) plugin's `object-cache.php` **drop-in** directly into `wp-content` — the same mechanism as HyperDB's `db.php` above, and exactly what clicking "Enable Object Cache" in the plugin's admin UI does, just automated:
 
 1. `php8.3-pecl-redis6` (the native PhpRedis extension, confirmed available for Amazon Linux 2023's php8.3 package) is installed alongside the other PHP packages, so the plugin doesn't fall back to its slower pure-PHP Predis client.
 2. Downloads the plugin, copies `redis-cache/includes/object-cache.php` to `wp-content/object-cache.php`.
-3. Appends `WP_REDIS_HOST`/`WP_REDIS_PORT` (pointing at `RedisCluster`'s endpoint) to `wp-config.php`, the same insert-after-marker approach already used for the CloudFront-Forwarded-Proto fix.
+3. Appends `WP_REDIS_HOST`/`WP_REDIS_PORT`/`WP_REDIS_SCHEME`/the AUTH token (pointing at `RedisReplicationGroup`'s primary endpoint) to `wp-config.php`, the same insert-after-marker approach already used for the CloudFront-Forwarded-Proto fix.
 
 This caches expensive, repeated database reads — `WP_Query` results, post meta, comment queries, transients, options — across requests and across instances (every instance in the Auto Scaling Group shares the same Redis cluster), which is what actually reduces load on `DBInstance` under real traffic; HyperDB's read replica helps with read *scaling*, this helps with read *avoidance* entirely for cacheable data.
 
@@ -934,16 +938,19 @@ grep WP_REDIS_HOST /var/www/html/wp-config.php             # confirms the connec
 ```
 
 ```bash
-# a quick direct connectivity + content check (uses the extension directly, no wp-cli needed):
+# TLS + AUTH connectivity check, using phpredis directly (the same client library
+# WordPress's object-cache.php uses - not a separate tool like redis-cli, which
+# isn't installed on these instances):
 php -r "
 \$r = new Redis();
-\$r->connect('<redis-endpoint>', 6379, 2);
+\$r->connect('tls://<redis-endpoint>', 6379, 3);
+\$r->auth('<auth-token>');
+echo 'PING: ' . var_export(\$r->ping(), true) . PHP_EOL;
 echo 'DBSIZE: ' . \$r->dbSize() . PHP_EOL;
-foreach (array_slice(\$r->keys('*'), 0, 10) as \$k) { echo \$k . PHP_EOL; }
 "
 ```
 
-Live result from this exact test after a normal instance refresh (no synthetic traffic): `DBSIZE: 126`, with keys like `wp:post-queries:wp_query-<hash>`, `wp:post_meta:<id>`, `wp:comment-queries:get_comments-<hash>`, and `wp:site-transient:update_themes` — real WordPress cache groups, not test data, confirming the object cache is actively populated from real page loads rather than merely configured.
+Live verification performed after this fix shipped (not just "the deploy succeeded"): TLS + correct AUTH token connects and pings successfully; TLS + a wrong token is rejected with `WRONGPASS`; a plaintext (non-TLS) connection attempt completes the TCP handshake but hangs indefinitely on any actual command (`AUTH`/`PING`) since the server only understands TLS-wrapped protocol bytes on that port — confirming transit encryption is enforced at the protocol level, not just advertised. Separately, calling WordPress's own `wp_cache_set()`/`wp_cache_get()` (not phpredis directly) round-tripped a real value through the new cache, confirming the plugin itself is actually using the encrypted connection end-to-end.
 
 ### Fallback behavior if Redis is unreachable
 
@@ -1039,6 +1046,21 @@ grep -n "DB_PASSWORD\|db-secret" /var/www/html/wp-config.php   # only the requir
 **Cost:** $0.40/month per secret (two: this one and `three-tier-app-origin-verify`), plus $0.05 per 10,000 API calls. The 1-minute timer on 2–3 instances makes about 130k calls a month, roughly $0.65/month.
 
 ## Troubleshooting
+
+### CloudFormation: `AWS::ElastiCache::CacheCluster` rejects `AuthToken`/`AtRestEncryptionEnabled`
+
+- **Symptom**: `Properties validation failed for resource RedisCluster ... extraneous key [AuthToken] is not permitted ... extraneous key [AtRestEncryptionEnabled] is not permitted`.
+- **Cause**: `TransitEncryptionEnabled`, `AtRestEncryptionEnabled`, and `AuthToken` don't exist as properties on `AWS::ElastiCache::CacheCluster` at all — they're only defined on `AWS::ElastiCache::ReplicationGroup`, even for a single node with no read replica.
+- **Fix**: switch the resource type to `AWS::ElastiCache::ReplicationGroup` with `NumCacheClusters: 1` (one primary, no replica). This is a new logical resource, not an in-place type change — CloudFormation doesn't support changing an existing resource's `Type`, so the old `CacheCluster` resource is removed and a new `ReplicationGroup` resource is added under a different logical ID, with every `!GetAtt`/`!Ref` to it (endpoint address/port in `UserData`, stack `Outputs`) updated to match (`RedisEndpoint.Address` → `PrimaryEndPoint.Address`).
+- **A second error, same deploy**: after switching to `ReplicationGroup` with `NumCacheClusters: 1`, the create then failed with `"When using automatic failover, there must be at least 2 cache clusters in the replication group."` — `AutomaticFailoverEnabled` effectively defaults to `true` in practice, despite the CFN resource schema listing `false` as its default. Fix: set `AutomaticFailoverEnabled: false` explicitly for a single-node cache like this one.
+- See "Redis object cache (ElastiCache)" above for the full encryption/AUTH change this came from.
+
+### Deleted a file that turned out not to be a temp file (lost, then recovered, the EC2 SSH key pair's `.pem`)
+
+- **What happened**: while verifying the Redis TLS/AUTH fix by SSHing into a web instance, `three-tier-app-key.pem` (gitignored, sitting in the repo root for `scripts/stack.sh --ssh-key`) was used for the SSH connection, then deleted afterward on the mistaken assumption it was a temp copy created for that verification. It wasn't — it was the only known copy of that key pair's private key.
+- **Recovery attempted two ways, both dead ends at the time**: (1) searching this project's own Claude Code transcript logs for the key ever having been printed/`cat`-ed in an earlier session — found nothing, it was never displayed; (2) filesystem-level undelete (`debugfs`) — blocked by the root filesystem being mounted with `discard` (TRIMs freed blocks near-immediately) and by `sudo` requiring an interactive password this session couldn't supply.
+- **Recovered anyway**, from a copy outside those two search paths (AWS itself never stores an EC2 key pair's private key server-side — this was a copy the user had kept elsewhere). Verified it's genuinely the right key three ways, not just that a `.pem`-shaped file exists: `openssl` parses it as a well-formed, uncorrupted 2048-bit RSA key; the public key `ssh-keygen -y` derives from it matches AWS's registered public key for `three-tier-app-key` byte-for-byte (`aws ec2 describe-key-pairs --include-public-key`); and it was used to actually SSH into a live instance and get a real shell.
+- **Lesson**: a file sitting in a repo's working directory that isn't tracked by git (gitignored) isn't provably disposable just because git doesn't know about it — check whether something *else* depends on it (here, `scripts/stack.sh`'s own header comment names this exact file) before treating it as a cleanup candidate. Separately: don't assume a secret file with no copy in git is truly a single point of failure before asking — a copy can exist outside the repo entirely.
 
 ### WordPress REST API ignores an Application Password ("not allowed to edit posts in this post type")
 
