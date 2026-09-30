@@ -301,6 +301,18 @@ Resources:
         PasswordLength: 32
         ExcludeCharacters: '/@"''\ '
 
+  # ElastiCache AuthToken: printable ASCII only, can't contain / @ " or whitespace.
+  RedisAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${EnvironmentName}-redis-auth
+      Description: Redis AUTH token; WordPress instances read this at runtime.
+      GenerateSecretString:
+        GenerateStringKey: token
+        SecretStringTemplate: '{}'
+        PasswordLength: 32
+        ExcludeCharacters: '/@"''\ '
+
   # Sent by CloudFront as X-Origin-Verify, so the ALB can reject requests that
   # came through any other CloudFront distribution.
   OriginVerifySecret:
@@ -873,17 +885,33 @@ Resources:
         - !Ref PrivateSubnet
         - !Ref PrivateSubnet2
 
-  RedisCluster:
-    Type: AWS::ElastiCache::CacheCluster
+  # AWS::ElastiCache::CacheCluster doesn't support TransitEncryptionEnabled/
+  # AtRestEncryptionEnabled/AuthToken at all (confirmed live: CFN rejects them as
+  # "extraneous key") - those only exist on ReplicationGroup, even for a single
+  # node with no read replica (NumCacheClusters: 1 = primary only).
+  # No explicit ReplicationGroupId: encryption is a createOnlyProperty, so any
+  # future change here replaces this resource - a hardcoded name would collide
+  # with the old one during CFN's create-before-delete ordering (same reason
+  # DBInstance never sets an explicit identifier).
+  RedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
     Properties:
-      ClusterName: !Sub ${EnvironmentName}-redis
+      ReplicationGroupDescription: !Sub ${EnvironmentName} Redis object cache
       Engine: redis
       EngineVersion: !Ref RedisEngineVersion
       CacheNodeType: !Ref RedisNodeType
-      NumCacheNodes: 1
+      NumCacheClusters: 1
+      # Live-confirmed: AutomaticFailoverEnabled effectively defaults to true
+      # (CREATE_FAILED: "automatic failover ... at least 2 cache clusters"),
+      # despite the CFN resource schema listing false as its default. This is a
+      # single-node object cache with no replica by design - explicitly off.
+      AutomaticFailoverEnabled: false
       CacheSubnetGroupName: !Ref RedisSubnetGroup
-      VpcSecurityGroupIds:
+      SecurityGroupIds:
         - !Ref RedisSecurityGroup
+      TransitEncryptionEnabled: true
+      AtRestEncryptionEnabled: true
+      AuthToken: !Sub '{{resolve:secretsmanager:${RedisAuthSecret}:SecretString:token}}'
       Tags:
         - Key: Name
           Value: !Sub ${EnvironmentName}-redis
@@ -899,7 +927,9 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !Ref DBMasterSecret
+                Resource:
+                  - !Ref DBMasterSecret
+                  - !Ref RedisAuthSecret
       # Required: the deploy role can only grant permissions within this boundary.
       PermissionsBoundary:
         Fn::ImportValue: !Sub ${EnvironmentName}-pipeline-app-role-boundary-arn
@@ -1041,6 +1071,42 @@ Resources:
               systemctl daemon-reload
               systemctl enable --now refresh-db-secret.timer
 
+              # Same pattern as the DB password: the Redis AUTH token never appears
+              # in UserData, and a 1-minute timer picks up a rotated token without
+              # replacing instances.
+              cat > /usr/local/bin/refresh-redis-secret <<'REFRESHEOF'
+              #!/bin/bash
+              set -euo pipefail
+              tok=$(aws secretsmanager get-secret-value --region ${AWS::Region} \
+                --secret-id ${RedisAuthSecret} --query SecretString --output text \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+              tmp=$(mktemp /etc/wordpress/.redis-secret.XXXXXX)
+              printf "<?php define( 'WP_REDIS_PASSWORD', '%s' );\n" "$tok" > "$tmp"
+              chown root:apache "$tmp"; chmod 640 "$tmp"
+              mv -f "$tmp" /etc/wordpress/redis-secret.php
+              REFRESHEOF
+              chmod 755 /usr/local/bin/refresh-redis-secret
+              /usr/local/bin/refresh-redis-secret
+
+              cat > /etc/systemd/system/refresh-redis-secret.service <<'UNITEOF'
+              [Unit]
+              Description=Refresh WordPress Redis AUTH token from Secrets Manager
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/local/bin/refresh-redis-secret
+              UNITEOF
+              cat > /etc/systemd/system/refresh-redis-secret.timer <<'UNITEOF'
+              [Unit]
+              Description=Refresh WordPress Redis AUTH token every minute
+              [Timer]
+              OnBootSec=1min
+              OnUnitActiveSec=1min
+              [Install]
+              WantedBy=timers.target
+              UNITEOF
+              systemctl daemon-reload
+              systemctl enable --now refresh-redis-secret.timer
+
               sed -i "s/database_name_here/${DBName}/" wp-config.php
               sed -i "s/username_here/${DBUsername}/" wp-config.php
               sed -i "/'DB_PASSWORD'/c\\require '/etc/wordpress/db-secret.php';" wp-config.php
@@ -1112,8 +1178,10 @@ Resources:
               cp redis-cache/includes/object-cache.php /var/www/html/wp-content/object-cache.php
 
               cat > /tmp/redis-config.php <<'PHPSNIPPET'
-              define( 'WP_REDIS_HOST', '${RedisCluster.RedisEndpoint.Address}' );
-              define( 'WP_REDIS_PORT', ${RedisCluster.RedisEndpoint.Port} );
+              define( 'WP_REDIS_HOST', '${RedisReplicationGroup.PrimaryEndPoint.Address}' );
+              define( 'WP_REDIS_PORT', ${RedisReplicationGroup.PrimaryEndPoint.Port} );
+              define( 'WP_REDIS_SCHEME', 'tls' );
+              require '/etc/wordpress/redis-secret.php';
               PHPSNIPPET
               sed -i "/Add any custom values between this line/r /tmp/redis-config.php" /var/www/html/wp-config.php
               rm -f /tmp/redis-config.php
@@ -1557,7 +1625,7 @@ Outputs:
 
   RedisEndpoint:
     Description: Redis endpoint used as WordPress's object cache
-    Value: !GetAtt RedisCluster.RedisEndpoint.Address
+    Value: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Address
 
   BackupVaultName:
     Description: AWS Backup vault name
