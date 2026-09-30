@@ -12,8 +12,11 @@
 #       billable is left. The pipeline stack (IAM only, free) is kept.
 # up:   recreates the stack from the newest final snapshot with the saved
 #       parameters, sets the restored DB's password to the new secret as soon as
-#       RDS is up (snapshots keep the old password), and verifies the site - and,
-#       with --ssh-key, a real MySQL login to both endpoints.
+#       RDS is up (snapshots keep the old password), verifies the site - and,
+#       with --ssh-key, a real MySQL login to both endpoints - then deletes the
+#       snapshot it just restored from (only once verification passes), so it
+#       doesn't linger indefinitely billing backup storage on top of the new
+#       live instance.
 #
 # See "Tear down and rebuild (cost saving)" in Deployment.md.
 
@@ -124,7 +127,7 @@ cmd_down() {
     done
   fi
 
-  say "6/8 Deleting stack $STACK (CloudFront alone takes ~15 min; expect 25-40 min total)"
+  say "6/8 Deleting stack $STACK (measured 5-12 min on two real teardowns; CloudFront's own deletion is the long pole)"
   run aws cloudformation delete-stack --stack-name "$STACK"
   if ! $DRY_RUN && ! aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
     echo "    first attempt failed - usually new ALB logs landed after emptying. Resources that failed:"
@@ -161,7 +164,7 @@ cmd_up() {
   [ -n "$SNAPSHOT" ] && [ "$SNAPSHOT" != None ] || die "no final snapshot found - pass --snapshot ID"
   local snap_user; snap_user=$(aws rds describe-db-snapshots --db-snapshot-identifier "$SNAPSHOT" --query 'DBSnapshots[0].MasterUsername' --output text)
 
-  say "Plan: recreate $STACK from snapshot $SNAPSHOT (expect 30-45 min)"
+  say "Plan: recreate $STACK from snapshot $SNAPSHOT (measured ~11-15 min on the most recent real restore)"
   local overrides=()
   while IFS='=' read -r k v; do overrides+=("$k=$v"); done < <(python3 -c "
 import json,sys
@@ -171,7 +174,7 @@ for k,v in sorted(p.items()):
   overrides+=("DBSnapshotIdentifier=$SNAPSHOT")
   printf '    %s\n' "${overrides[@]}" | sed 's/\(SSHLocationCidr=\).*/\1<saved>/'
 
-  say "1/5 Template upload bucket (the stack's own bucket doesn't exist until it's created)"
+  say "1/6 Template upload bucket (the stack's own bucket doesn't exist until it's created)"
   local bucket="$STACK-bootstrap-$account"
   if ! aws s3api head-bucket --bucket "$bucket" 2>/dev/null; then
     run aws s3api create-bucket --bucket "$bucket" --query Location --output text
@@ -180,7 +183,7 @@ for k,v in sorted(p.items()):
   fi
   echo "    $bucket"
 
-  say "2/5 Creating the stack (runs in the background while step 3 watches for RDS)"
+  say "2/6 Creating the stack (runs in the background while step 3 watches for RDS)"
   local log="$STATE_DIR/up-$(date +%Y%m%d-%H%M%S).log" pid=""
   if $DRY_RUN; then
     echo "    [dry-run] aws cloudformation deploy --template-file $TEMPLATE --s3-bucket $bucket --stack-name $STACK --capabilities CAPABILITY_NAMED_IAM --parameter-overrides ..."
@@ -191,7 +194,7 @@ for k,v in sorted(p.items()):
     echo "    log: $log"
   fi
 
-  say "3/5 Setting the restored DB's password from the new secret as soon as RDS is up"
+  say "3/6 Setting the restored DB's password from the new secret as soon as RDS is up"
   echo "    (a snapshot keeps the old password; instances read the secret, so this must happen"
   echo "    before WordPress needs the DB - the read replica is created in between, which gives time)"
   if ! $DRY_RUN; then
@@ -222,34 +225,52 @@ for k,v in sorted(p.items()):
     echo "    [dry-run] wait for DBInstance CREATE_COMPLETE, then modify-db-instance --master-user-password <secret>"
   fi
 
-  say "4/5 Waiting for the stack to finish"
+  say "4/6 Waiting for the stack to finish"
   if ! $DRY_RUN; then
     wait "$pid" || { tail -20 "$log"; die "stack creation failed - see $log and the stack's events"; }
     echo "    $(stack_status "$STACK")"
   fi
 
-  say "5/5 Verifying"
-  $DRY_RUN && { echo "    [dry-run] would check: site returns 200, and (with --ssh-key) MySQL login to both endpoints"; return; }
-  local url; url=$(output WordPressURL)
+  say "5/6 Verifying"
   local code=000
-  for _ in $(seq 30); do code=$(curl -s -o /dev/null -w '%{http_code}' "$url/" || true); [ "$code" = 200 ] && break; sleep 20; done
-  echo "    $url -> HTTP $code"
-  local primary replica ip
-  primary=$(output DBInstanceEndpoint); replica=$(output DBReadReplicaEndpoint)
-  ip=$(aws ec2 describe-instances --filters Name=tag:Name,Values=three-tier-app-wordpress Name=instance-state-name,Values=running \
-        --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-  if [ -n "$SSH_KEY" ]; then
-    # A page load isn't proof the DB works (Redis can serve pages with a dead DB) - log in for real.
-    ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "ec2-user@$ip" 'bash -s' "$primary" "$replica" <<'EOF'
+  if $DRY_RUN; then
+    echo "    [dry-run] would check: site returns 200, and (with --ssh-key) MySQL login to both endpoints"
+  else
+    local url; url=$(output WordPressURL)
+    for _ in $(seq 30); do code=$(curl -s -o /dev/null -w '%{http_code}' "$url/" || true); [ "$code" = 200 ] && break; sleep 20; done
+    echo "    $url -> HTTP $code"
+    local primary replica ip
+    primary=$(output DBInstanceEndpoint); replica=$(output DBReadReplicaEndpoint)
+    ip=$(aws ec2 describe-instances --filters Name=tag:Name,Values=three-tier-app-wordpress Name=instance-state-name,Values=running \
+          --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+    if [ -n "$SSH_KEY" ]; then
+      # A page load isn't proof the DB works (Redis can serve pages with a dead DB) - log in for real.
+      ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "ec2-user@$ip" 'bash -s' "$primary" "$replica" <<'EOF'
 export MYSQL_PWD=$(sudo php -r 'include "/etc/wordpress/db-secret.php"; echo DB_PASSWORD;')
 U=$(sudo sed -n "s/.*'DB_USER', '\([^']*\)'.*/\1/p" /var/www/html/wp-config.php)
 for h in "$@"; do echo "    ${h%%.*}: $(mysql -h "$h" -u "$U" -N -e "SELECT 'login OK', @@read_only" 2>&1 | tail -1)"; done
 EOF
-  else
-    echo "    Not verified: the database login. Pass --ssh-key to check it, or run the diagnostic in"
-    echo "    Deployment.md ('Site loads fine, but logins and writes fail') against $ip."
+    else
+      echo "    Not verified: the database login. Pass --ssh-key to check it, or run the diagnostic in"
+      echo "    Deployment.md ('Site loads fine, but logins and writes fail') against $ip."
+    fi
+    echo "    Then log in to $url/wp-admin/ once - a login is the first thing that writes to the DB."
   fi
-  echo "    Then log in to $url/wp-admin/ once - a login is the first thing that writes to the DB."
+
+  say "6/6 Deleting the snapshot this rebuild restored from"
+  echo "    Otherwise it lingers indefinitely at \$0.095/GB-month on top of the new live instance's"
+  echo "    own storage - easy to forget since 'up' never needed it again once the restore succeeds."
+  if $DRY_RUN; then
+    echo "    [dry-run] would check the site verified (HTTP 200) before deleting, then:"
+    echo "    [dry-run] aws rds delete-db-snapshot --db-snapshot-identifier $SNAPSHOT"
+  elif [ "$code" = 200 ]; then
+    run aws rds delete-db-snapshot --db-snapshot-identifier "$SNAPSHOT" --query 'DBSnapshot.Status' --output text
+    echo "    deleted $SNAPSHOT"
+  else
+    echo "    Skipped: the site didn't verify (HTTP $code), so $SNAPSHOT was kept as a safety net."
+    echo "    Once you've confirmed the rebuild is actually fine, delete it by hand:"
+    echo "    aws rds delete-db-snapshot --db-snapshot-identifier $SNAPSHOT"
+  fi
 }
 
 cmd=${1:-}; shift || true

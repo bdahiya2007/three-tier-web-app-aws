@@ -1565,12 +1565,12 @@ The RDS instance has `DeletionPolicy: Snapshot`, so deleting the stack takes a f
 
 ## Tear down and rebuild (cost saving)
 
-The full stack costs about **$3.10–3.30 a day** (≈ $95–100/month), paid from Free plan credits at the time of writing. Most of that is instance-hours that stop the moment the stack is gone. [`scripts/stack.sh`](scripts/stack.sh) deletes the app stack with one command and rebuilds it with another, keeping the database. **While it's down, the cost is roughly the final DB snapshot's storage (cents a month).**
+The full stack costs about **$3.10–3.30 a day** (≈ $95–100/month), paid from Free plan credits at the time of writing. Most of that is instance-hours that stop the moment the stack is gone. [`scripts/stack.sh`](scripts/stack.sh) deletes the app stack with one command and rebuilds it with another, keeping the database. **While it's down, the cost is roughly the final DB snapshot's storage** — at RDS's `$0.095/GB-month` for backup storage beyond the free allocation, about $1.90/month for this stack's ~20GB, *if* it's the only leftover snapshot. `up` now deletes the snapshot it restored from once the rebuild verifies, specifically so repeated `down`/`up` cycles don't quietly accumulate several of these in parallel.
 
 ```bash
 scripts/stack.sh status                 # what exists, what's billable, which snapshot 'up' would use
-scripts/stack.sh down                   # delete (asks you to type the stack name); ~25-40 min
-scripts/stack.sh up --ssh-key ~/.ssh/<your-key>.pem   # rebuild from the final snapshot; ~30-45 min
+scripts/stack.sh down                   # delete (asks you to type the stack name); measured 15-25 min
+scripts/stack.sh up --ssh-key ~/.ssh/<your-key>.pem   # rebuild from the final snapshot; measured ~15-20 min
 ```
 
 Both `down` and `up` accept `--dry-run`, which prints every step and each command it would run, using read-only calls only. Run it first to see exactly what will happen. `down --yes` skips the confirmation prompt.
@@ -1604,11 +1604,12 @@ The site is **offline while the stack is down**. DNS records, the CloudFront dis
 3. Starts `aws cloudformation deploy` with the saved parameters plus `DBSnapshotIdentifier`, in the background.
 4. **Watches for the restored `DBInstance`, then immediately sets its password from the new `three-tier-app-db-master` secret.** RDS snapshots keep the *old* master password, while instances read the *new* secret. CloudFormation creates the read replica before the web servers (their `UserData` needs its endpoint), which leaves time to do this before WordPress needs the database. It retries while RDS is briefly busy creating the replica.
 5. Waits for the stack, then verifies: the site returns 200 and, **with `--ssh-key`, a real MySQL login to both primary and replica** from an instance. A page load alone isn't enough; see "Site loads fine, but logins and writes fail" in Troubleshooting.
-6. Then **log in to `/wp-admin` once**: a login is the first thing that writes to the database.
+6. **Deletes the snapshot it just restored from** — but only if the site verified (HTTP 200). Otherwise `up` never needed that snapshot again, and leaving it around bills $0.095/GB-month indefinitely on top of the new live instance's own storage, on top of every *other* leftover snapshot from a previous cycle that was never cleaned up either. If verification failed, the snapshot is kept as a safety net and its deletion command is printed for you to run by hand once you've confirmed the rebuild is actually fine.
+7. Then **log in to `/wp-admin` once**: a login is the first thing that writes to the database.
 
 ### Things to know
 
 - **Keep `DBSnapshotIdentifier` as `up` set it.** CI deploys reuse previous parameter values, so this happens automatically. *Changing* it on an existing stack makes CloudFormation replace the database.
 - **Don't approve a CI deploy while the stack is down.** `deploy.yml` fails at its first step anyway (the stack's bucket output doesn't exist), so it can't accidentally create a fresh, empty stack. Rebuild with `up`, not by merging.
 - **Uploads:** if the blog has images when you run `down`, they're gone from EFS after `up`, while the restored database still references them. `content/` has the files. Re-upload them from `content/wordpress/media/` through wp-admin (Media → Add New keeps the same filenames), or restore into an empty site with `wp_content.py restore`. An automated EFS backup/restore for uploads isn't built yet.
-- **What's not tested end to end yet:** `down` and `up` against the live stack. `status` and both `--dry-run` modes were run against it, and all resource lookups (DB IDs, buckets, the 10 recovery points, secrets) resolved correctly. The first real `down`/`up` should be done when an outage of about an hour is acceptable. Record anything that behaves differently here.
+- **Tested end to end against the live stack**, multiple times (confirmed via CloudFormation's own stack history, not just assumed): real `down`/`up` cycles measured **5-12 min** for the `delete-stack` call itself and **~11-15 min** for the restore's `CREATE_COMPLETE`, both considerably faster than this doc's original estimates (25-40 min / 30-45 min) — likely thanks to later speedups like the `cfn-signal`-based readiness check replacing a fixed wait. `stack.sh`'s own added steps (password reset, site/DB verification, and now snapshot cleanup) add a bit more wall-clock time on top of those core CloudFormation numbers.
