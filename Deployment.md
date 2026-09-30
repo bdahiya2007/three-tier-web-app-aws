@@ -896,7 +896,7 @@ Found during security architect reviews (the first for this feature; a second, s
 - **No TLS enforcement in transit** between the web tier and either RDS instance (`require_secure_transport` unset, using the MySQL engine default). Check with `aws rds describe-db-parameters --db-parameter-group-name <group> --query "Parameters[?ParameterName=='require_secure_transport']"`. Partially mitigated by VPC-level network isolation (unreachable from outside the VPC regardless), but doesn't meet defense-in-depth for data-in-transit on its own. Lower-risk to remediate than the encryption gap — a parameter group change plus adding SSL context to the MySQL/HyperDB connections, no instance replacement needed.
 - ~~**Redis has no encryption in transit, at rest, or AUTH token**~~ — **FIXED**: `RedisReplicationGroup` (TLS + AUTH token, see "Redis object cache" below).
 - **No Multi-AZ** on the RDS primary (roughly doubles RDS cost). Deletion protection is now on for both instances.
-- **WordPress connects as the RDS master user**, not a least-privilege application user.
+- ~~**WordPress connects as the RDS master user**~~ — **FIXED**: a dedicated `wordpress_app` user (see "Least-privilege WordPress DB user" below).
 - **Three WAF managed rule groups are still in Count mode** (`KnownBadInputs`, `WordPress`, `PHP`): they log matches but don't block yet. They switch to Block once the WAF logs show no false positives on real traffic (see "WAF logs and promoting Count rules to Block").
 - **Smaller hardening items:** no explicit `MetadataOptions` (IMDSv2 is enforced today only by the AL2023 AMI default), plain HTTP on the in-VPC ALB→instance hop, unpinned WordPress/plugin downloads with no checksum, `chmod -R 755` on the web root (lower impact since the DB password moved out of `wp-config.php`/`db-config.php` into `/etc/wordpress/db-secret.php`, mode `640`), no CloudFront security-headers policy, no `aws:SecureTransport` deny on the ALB logs bucket, GitHub Actions pinned by tag rather than SHA.
 - **Accepted, not planned:** web servers in public subnets. Moving them to private subnets needs a NAT Gateway (~$33/month + $0.045/GB), which would roughly double the running cost; the security groups already limit HTTP to the ALB and SSH to one IP.
@@ -908,6 +908,34 @@ Read replicas are asynchronous — there's a small delay between a write landing
 ### After adding/changing anything replica-related
 
 Same rule as any other `UserData` change: a stack update alone doesn't touch already-running instances. Run an instance refresh (see "Update running instances after a launch template change" above) to actually roll out `db.php`/`db-config.php` to instances that existed before this feature was added.
+
+## Least-privilege WordPress DB user
+
+WordPress used to connect to both RDS endpoints as `DBUsername` (the RDS **master** user, `dbadmin`) — meaning anything that could compromise WordPress (a malicious plugin, a code injection bug) would inherit full database admin rights: creating/dropping databases, managing other users, changing server settings, not just reading and writing blog data.
+
+**Fix**: a dedicated `wordpress_app` user (`DBAppUsername` parameter), created idempotently by every instance's `UserData` using the master credentials it already has (`CREATE USER IF NOT EXISTS` + `GRANT`), with a password in its own `DBAppUserSecret` — separate from the master password, refreshed onto instances every minute by a `refresh-db-app-secret` systemd timer, same pattern as the DB master password and the Redis AUTH token. `db-config.php`'s two `add_database()` calls (primary + replica) now use this user instead of the master one. The instance readiness healthcheck (the `mysql -u ... SELECT 1` check before `cfn-signal`) was switched to test this user too, since it's what WordPress actually connects as going forward — testing the master user there would no longer prove the thing that matters.
+
+**Grant set**: `SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES, LOCK TABLES` on the WordPress database only — the standard WordPress grant set, nothing admin-shaped. No `DROP`, `ALTER`, `GRANT OPTION`, or access to any other database (including `mysql` itself, which doesn't show up in `SHOW DATABASES` for this user).
+
+**Cost**: ~$0.84/month — Secrets Manager's $0.40/secret/month for the new `DBAppUserSecret`, plus roughly $0.44/month in `GetSecretValue` API calls from the 1-minute refresh timer across both instances (verified via `aws pricing get-products --service-code AWSSecretsManager`, not estimated).
+
+### Verify it's actually restricted, not just switched
+
+Logged in directly as `wordpress_app` against both endpoints (not just checked that WordPress's admin screen loads):
+
+```bash
+# on any instance, using the credentials WordPress itself has:
+APP_PW=$(sudo php -r 'include "/etc/wordpress/db-app-secret.php"; echo DB_APP_PASSWORD;')
+export MYSQL_PWD="$APP_PW"
+mysql -h <primary-endpoint> -u wordpress_app -D <dbname> -N -e 'SELECT COUNT(*) FROM wp_options;'   # works
+mysql -h <replica-endpoint> -u wordpress_app -D <dbname> -N -e 'SELECT COUNT(*) FROM wp_options;'   # works
+mysql -h <primary-endpoint> -u wordpress_app -D <dbname> -e "GRANT ALL PRIVILEGES ON *.* TO 'wordpress_app'@'%';"   # denied
+mysql -h <primary-endpoint> -u wordpress_app -D <dbname> -e "CREATE DATABASE hacker_test;"                          # denied
+mysql -h <primary-endpoint> -u wordpress_app -D <dbname> -e "DROP TABLE wp_options;"                                # denied
+mysql -h <primary-endpoint> -u wordpress_app -D <dbname> -e "ALTER TABLE wp_options ADD COLUMN hacked INT;"         # denied
+```
+
+Live result: `SELECT` succeeds on both endpoints with real row counts; `GRANT`/`CREATE DATABASE`/`DROP`/`ALTER` all fail with `Access denied`/`... command denied`. Then confirmed the grant set is actually *sufficient*, not just restricted, by running a real create → read → update → delete cycle through WordPress's own PHP API (`wp_insert_post()`/`get_post()`/`wp_update_post()`/`wp_delete_post()`, via `wp-load.php`) rather than raw SQL — proving the app user can do everything WordPress itself needs, end to end, not just that a `SELECT` happens to work.
 
 ## Redis object cache (ElastiCache)
 
