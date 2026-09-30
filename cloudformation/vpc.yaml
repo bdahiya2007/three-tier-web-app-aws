@@ -57,6 +57,12 @@ Parameters:
     Description: Master username for the RDS instance.
     NoEcho: true
 
+  DBAppUsername:
+    Type: String
+    Default: wordpress_app
+    Description: Least-privilege DB user WordPress actually connects as.
+    NoEcho: true
+
   DBInstanceClass:
     Type: String
     Default: db.t3.micro
@@ -297,6 +303,19 @@ Resources:
       Description: RDS master credentials; WordPress instances read this at runtime.
       GenerateSecretString:
         SecretStringTemplate: !Sub '{"username":"${DBUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '/@"''\ '
+
+  # Least-privilege app user WordPress actually connects as (security gap #16) -
+  # same character exclusions as DBMasterSecret, for the same reasons.
+  DBAppUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${EnvironmentName}-db-app
+      Description: Least-privilege RDS app credentials; WordPress instances read this at runtime.
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DBAppUsername}"}'
         GenerateStringKey: password
         PasswordLength: 32
         ExcludeCharacters: '/@"''\ '
@@ -929,6 +948,7 @@ Resources:
                 Action: secretsmanager:GetSecretValue
                 Resource:
                   - !Ref DBMasterSecret
+                  - !Ref DBAppUserSecret
                   - !Ref RedisAuthSecret
       # Required: the deploy role can only grant permissions within this boundary.
       PermissionsBoundary:
@@ -1071,6 +1091,58 @@ Resources:
               systemctl daemon-reload
               systemctl enable --now refresh-db-secret.timer
 
+              # Same pattern, for the least-privilege app user's own password
+              # (security gap #16 - WordPress no longer connects as the master user).
+              cat > /usr/local/bin/refresh-db-app-secret <<'REFRESHEOF'
+              #!/bin/bash
+              set -euo pipefail
+              pw=$(aws secretsmanager get-secret-value --region ${AWS::Region} \
+                --secret-id ${DBAppUserSecret} --query SecretString --output text \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
+              tmp=$(mktemp /etc/wordpress/.db-app-secret.XXXXXX)
+              printf "<?php define( 'DB_APP_PASSWORD', '%s' );\n" "$pw" > "$tmp"
+              chown root:apache "$tmp"; chmod 640 "$tmp"
+              mv -f "$tmp" /etc/wordpress/db-app-secret.php
+              REFRESHEOF
+              chmod 755 /usr/local/bin/refresh-db-app-secret
+              /usr/local/bin/refresh-db-app-secret
+
+              cat > /etc/systemd/system/refresh-db-app-secret.service <<'UNITEOF'
+              [Unit]
+              Description=Refresh WordPress app DB password from Secrets Manager
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/local/bin/refresh-db-app-secret
+              UNITEOF
+              cat > /etc/systemd/system/refresh-db-app-secret.timer <<'UNITEOF'
+              [Unit]
+              Description=Refresh WordPress app DB password every minute
+              [Timer]
+              OnBootSec=1min
+              OnUnitActiveSec=1min
+              [Install]
+              WantedBy=timers.target
+              UNITEOF
+              systemctl daemon-reload
+              systemctl enable --now refresh-db-app-secret.timer
+
+              # Idempotent: safe to re-run on every boot. Uses the master credentials
+              # every instance already has to create the least-privilege app user
+              # WordPress will actually connect as - SELECT/INSERT/UPDATE/DELETE plus
+              # the two housekeeping grants WordPress needs, nothing admin-shaped.
+              # Tracing off so neither password reaches cloud-init-output.log.
+              set +x
+              master_pw=$(php -r 'include "/etc/wordpress/db-secret.php"; echo DB_PASSWORD;')
+              app_pw=$(php -r 'include "/etc/wordpress/db-app-secret.php"; echo DB_APP_PASSWORD;')
+              export MYSQL_PWD="$master_pw"
+              mysql -h ${DBInstance.Endpoint.Address} -u '${DBUsername}' -e "
+                CREATE USER IF NOT EXISTS '${DBAppUsername}'@'%' IDENTIFIED BY '$app_pw';
+                ALTER USER '${DBAppUsername}'@'%' IDENTIFIED BY '$app_pw';
+                GRANT SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES, LOCK TABLES ON \`${DBName}\`.* TO '${DBAppUsername}'@'%';
+              " || echo "app DB user provisioning failed (attempt $i/1) - will retry on next boot/instance"
+              unset MYSQL_PWD master_pw app_pw
+              set -x
+
               # Same pattern as the DB password: the Redis AUTH token never appears
               # in UserData, and a 1-minute timer picks up a rotated token without
               # replacing instances.
@@ -1141,10 +1213,11 @@ Resources:
 
               cat > /var/www/html/db-config.php <<DBCONFIGEOF
               <?php
+              require '/etc/wordpress/db-app-secret.php';
               \$wpdb->add_database(array(
                   'host'     => '${DBInstance.Endpoint.Address}',
-                  'user'     => '${DBUsername}',
-                  'password' => DB_PASSWORD,
+                  'user'     => '${DBAppUsername}',
+                  'password' => DB_APP_PASSWORD,
                   'name'     => '${DBName}',
                   'write'    => 1,
                   'read'     => 0,
@@ -1154,8 +1227,8 @@ Resources:
 
               \$wpdb->add_database(array(
                   'host'     => '${DBReadReplica.Endpoint.Address}',
-                  'user'     => '${DBUsername}',
-                  'password' => DB_PASSWORD,
+                  'user'     => '${DBAppUsername}',
+                  'password' => DB_APP_PASSWORD,
                   'name'     => '${DBName}',
                   'write'    => 0,
                   'read'     => 1,
@@ -1200,17 +1273,20 @@ Resources:
 
               systemctl restart httpd
 
-              # Ready = both DB endpoints accept the secret's password AND WordPress
-              # answers. A page load alone isn't proof: the Redis object cache can serve
+              # Ready = both DB endpoints accept the app user's password AND WordPress
+              # answers. Checks the app user, not master - that's what WordPress
+              # actually connects as, so it's the credential that matters here (same
+              # "verify the real dependency" reasoning as everywhere else in this
+              # file). A page load alone isn't proof: the Redis object cache can serve
               # pages with a dead DB. Retries for up to 10 min, since scripts/stack.sh up
               # sets a restored DB's password while instances may already be booting.
               # Tracing off so the password never reaches cloud-init-output.log.
               set +x
               ready=false
               for i in $(seq 1 20); do
-                export MYSQL_PWD=$(php -r 'include "/etc/wordpress/db-secret.php"; echo DB_PASSWORD;')
-                if mysql -h ${DBInstance.Endpoint.Address} -u '${DBUsername}' -N -e 'SELECT 1' >/dev/null 2>&1 \
-                   && mysql -h ${DBReadReplica.Endpoint.Address} -u '${DBUsername}' -N -e 'SELECT 1' >/dev/null 2>&1 \
+                export MYSQL_PWD=$(php -r 'include "/etc/wordpress/db-app-secret.php"; echo DB_APP_PASSWORD;')
+                if mysql -h ${DBInstance.Endpoint.Address} -u '${DBAppUsername}' -N -e 'SELECT 1' >/dev/null 2>&1 \
+                   && mysql -h ${DBReadReplica.Endpoint.Address} -u '${DBAppUsername}' -N -e 'SELECT 1' >/dev/null 2>&1 \
                    && curl -s -f -o /dev/null http://localhost/; then
                   ready=true; break
                 fi
