@@ -164,7 +164,7 @@ Adding the RDS read replica was followed by a dedicated security/architecture re
 - RDS has no Multi-AZ (roughly doubles RDS compute cost).
 - Accepted rather than planned: web servers in public subnets (a NAT Gateway would roughly double the running cost).
 
-A one-page index of every finding — severity, risk if unfixed, fix, and how each fix was verified live — is in [SECURITY_CHECKLIST.md](SECURITY_CHECKLIST.md).
+A one-page index of every finding — severity, risk if unfixed, fix, and how each fix was verified live — is in [SECURITY_CHECKLIST.md](docs/SECURITY_CHECKLIST.md).
 
 The complete list, with verification commands and planned fixes, is in [Deployment.md](Deployment.md#known-security-gaps-not-yet-remediated--flagged-for-a-decision-not-overlooked).
 
@@ -179,6 +179,8 @@ Full methodology (exact commands, the counter values, the `read_only` proof) is 
 │   │                              # CloudWatch dashboard, logging (S3 + CloudWatch Logs)
 │   └── pipeline.yaml             # GitHub OIDC deploy role, Backup service role, permissions boundary
 │                                  # (deployed manually by an admin, never by CI)
+├── docs/
+│   └── SECURITY_CHECKLIST.md     # Every security finding: severity, risk, fix, live verification
 ├── terraform/                    # Earlier, simpler baseline (see note below) — not feature-equivalent
 ├── .github/workflows/deploy.yml  # CI/CD: GitHub OIDC authentication, deploy on push to main
 ├── Deployment.md                 # Full deployment guide, every parameter, and an extensive
