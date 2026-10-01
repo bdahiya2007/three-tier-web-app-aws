@@ -479,6 +479,18 @@ Resources:
               Service: delivery.logs.amazonaws.com
             Action: s3:GetBucketAcl
             Resource: !Sub arn:aws:s3:::${ALBLogsBucket}
+          # AWS's log-delivery services only ever use TLS, so this can't break
+          # delivery (security gap #17).
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub arn:aws:s3:::${ALBLogsBucket}
+              - !Sub arn:aws:s3:::${ALBLogsBucket}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
 
   ApplicationLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
@@ -691,12 +703,16 @@ Resources:
             SampledRequestsEnabled: true
             CloudWatchMetricsEnabled: true
             MetricName: !Sub ${EnvironmentName}-waf-login-rate
-        # Count first, not Block: review the WAF logs for false positives on
-        # real traffic before switching OverrideAction to None.
+        # Was Count-only, reviewed via CloudWatch Logs Insights against
+        # aws-waf-logs-three-tier-app (~2 days, 618 requests): all 3 groups
+        # combined, only 8 real matches, every one unambiguous scanner traffic
+        # (/.env, /.aws/config, /xmlrpc.php, /wp-includes/wlwmanifest.xml from
+        # known bot IPs) - zero false positives on real site/admin traffic.
+        # Switched to Block (security gap #14).
         - Name: AWS-AWSManagedRulesKnownBadInputsRuleSet
           Priority: 4
           OverrideAction:
-            Count: {}
+            None: {}
           Statement:
             ManagedRuleGroupStatement:
               VendorName: AWS
@@ -708,7 +724,7 @@ Resources:
         - Name: AWS-AWSManagedRulesWordPressRuleSet
           Priority: 5
           OverrideAction:
-            Count: {}
+            None: {}
           Statement:
             ManagedRuleGroupStatement:
               VendorName: AWS
@@ -720,7 +736,7 @@ Resources:
         - Name: AWS-AWSManagedRulesPHPRuleSet
           Priority: 6
           OverrideAction:
-            Count: {}
+            None: {}
           Statement:
             ManagedRuleGroupStatement:
               VendorName: AWS
@@ -766,6 +782,29 @@ Resources:
         - Key: Name
           Value: !Sub ${EnvironmentName}-${CustomDomainName}
 
+  # Conservative maxAge, no preload/includeSubDomains: this is a portfolio
+  # project whose domain could change hands or be reused later, and HSTS
+  # preload is effectively permanent across browsers (security gap #17).
+  CloudFrontResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub ${EnvironmentName}-security-headers
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 2592000
+            IncludeSubdomains: false
+            Preload: false
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: SAMEORIGIN
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -807,6 +846,7 @@ Resources:
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
           # "AllViewerAndCloudFrontHeaders-2022-06" - avoids a /wp-admin redirect loop.
           OriginRequestPolicyId: 33f36d7e-f396-46d9-90e0-52428a34d9dc
+          ResponseHeadersPolicyId: !Ref CloudFrontResponseHeadersPolicy
         ViewerCertificate:
           AcmCertificateArn: !Ref CustomDomainCertificate
           SslSupportMethod: sni-only
@@ -997,6 +1037,11 @@ Resources:
           Arn: !GetAtt CloudWatchAgentInstanceProfile.Arn
         SecurityGroupIds:
           - !Ref WebServerSecurityGroup
+        # Already IMDSv2-only via the AL2023 AMI default - explicit so it
+        # stays true regardless of AMI defaults changing (security gap #17).
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
         TagSpecifications:
           - ResourceType: instance
             Tags:
