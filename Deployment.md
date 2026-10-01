@@ -776,8 +776,9 @@ A `mysql`-compatible client (`mariadb105`) is already installed there by the Wor
 ssh -i <your-key-pair-name>.pem ec2-user@<instance-public-ip>
 
 # once connected:
-mysql -h <db-endpoint> -P 3306 -u <username> -p <db-name>
+mysql --ssl -h <db-endpoint> -P 3306 -u <username> -p <db-name>
 ```
+(`--ssl` is required since TLS enforcement shipped — see "TLS between WordPress and RDS." Without it, the mariadb client connects in plaintext and RDS rejects it outright.)
 
 It will prompt with `Enter password:`. The password is in Secrets Manager: on the instance, `sudo cat /etc/wordpress/db-secret.php` shows it, or from your machine:
 
@@ -892,8 +893,9 @@ If `db.php` is missing, WordPress silently falls back to its built-in single-con
 
 ```bash
 # on any instance, with $PRIMARY_HOST/$REPLICA_HOST/$DBUSER/$DBPASS resolved from db-config.php:
-mysql -h "$PRIMARY_HOST" -u "$DBUSER" -p"$DBPASS" -e "SHOW GLOBAL STATUS LIKE 'Com_select';"
-mysql -h "$REPLICA_HOST" -u "$DBUSER" -p"$DBPASS" -e "SHOW GLOBAL STATUS LIKE 'Com_select';"
+# --ssl is required since TLS enforcement shipped (see "TLS between WordPress and RDS")
+mysql --ssl -h "$PRIMARY_HOST" -u "$DBUSER" -p"$DBPASS" -e "SHOW GLOBAL STATUS LIKE 'Com_select';"
+mysql --ssl -h "$REPLICA_HOST" -u "$DBUSER" -p"$DBPASS" -e "SHOW GLOBAL STATUS LIKE 'Com_select';"
 
 for i in $(seq 1 15); do curl -s -o /dev/null http://localhost/; done
 
@@ -906,7 +908,7 @@ Live result from this exact test: replica `Com_select` +399 across 15 requests (
 To prove writes land on the primary specifically (not just "the site works"), the decisive test isn't watching counters move together — replication makes the replica's write-related counters move too, just from applying the primary's binlog, which looks identical to a real routing bug at a glance. The actual proof is trying to write to the replica directly and confirming it's rejected:
 
 ```bash
-mysql -h "$REPLICA_HOST" -u "$DBUSER" -p"$DBPASS" "$DBNAME" -e "INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('should_fail_test', 'x', 'no');"
+mysql --ssl -h "$REPLICA_HOST" -u "$DBUSER" -p"$DBPASS" "$DBNAME" -e "INSERT INTO wp_options (option_name, option_value, autoload) VALUES ('should_fail_test', 'x', 'no');"
 # expected: ERROR 1290 (HY000): The MySQL server is running with the --read-only option ...
 ```
 
@@ -917,7 +919,7 @@ If a real `$wpdb` write through WordPress succeeds without error (it does), and 
 Found during security architect reviews (the first for this feature; a second, stack-wide pass added the items after the first two), deliberately left as-is pending a decision or a planned fix rather than fixed silently:
 
 - **Neither RDS instance is encrypted at rest** (`StorageEncrypted: false` on both). Check with `aws rds describe-db-instances --query "DBInstances[].[DBInstanceIdentifier,StorageEncrypted]"`. This predates the replica, but a read replica must match its source's encryption status — so adding the replica locked this gap into two instances instead of one. Remediation requires snapshot → restore-as-encrypted for the primary (a genuinely disruptive operation — new endpoint, same complexity class as the earlier snapshot-restore work in this file), then recreating the replica from the now-encrypted primary.
-- **TLS in transit — stage 1 of 2 shipped, enforcement not yet on.** WordPress's own connections now use TLS (see "TLS between WordPress and RDS" below), but `require_secure_transport` itself is still unset, so a non-TLS connection isn't actually *rejected* yet — only WordPress's own client-side behavior changed so far. Stage 2 (turning enforcement on, after this stage proved stable) is tracked separately.
+- ~~**TLS in transit between WordPress and RDS**~~ — **FIXED**: both stages shipped — WordPress's connections use TLS, and `require_secure_transport` now rejects anything that doesn't (see "TLS between WordPress and RDS" below).
 - ~~**Redis has no encryption in transit, at rest, or AUTH token**~~ — **FIXED**: `RedisReplicationGroup` (TLS + AUTH token, see "Redis object cache" below).
 - **No Multi-AZ** on the RDS primary (roughly doubles RDS cost). Deletion protection is now on for both instances.
 - ~~**WordPress connects as the RDS master user**~~ — **FIXED**: a dedicated `wordpress_app` user (see "Least-privilege WordPress DB user" below).
@@ -951,19 +953,19 @@ Logged in directly as `wordpress_app` against both endpoints (not just checked t
 # on any instance, using the credentials WordPress itself has:
 APP_PW=$(sudo php -r 'include "/etc/wordpress/db-app-secret.php"; echo DB_APP_PASSWORD;')
 export MYSQL_PWD="$APP_PW"
-mysql -h <primary-endpoint> -u wordpress_app -D <dbname> -N -e 'SELECT COUNT(*) FROM wp_options;'   # works
-mysql -h <replica-endpoint> -u wordpress_app -D <dbname> -N -e 'SELECT COUNT(*) FROM wp_options;'   # works
-mysql -h <primary-endpoint> -u wordpress_app -D <dbname> -e "GRANT ALL PRIVILEGES ON *.* TO 'wordpress_app'@'%';"   # denied
-mysql -h <primary-endpoint> -u wordpress_app -D <dbname> -e "CREATE DATABASE hacker_test;"                          # denied
-mysql -h <primary-endpoint> -u wordpress_app -D <dbname> -e "DROP TABLE wp_options;"                                # denied
-mysql -h <primary-endpoint> -u wordpress_app -D <dbname> -e "ALTER TABLE wp_options ADD COLUMN hacked INT;"         # denied
+mysql --ssl -h <primary-endpoint> -u wordpress_app -D <dbname> -N -e 'SELECT COUNT(*) FROM wp_options;'   # works
+mysql --ssl -h <replica-endpoint> -u wordpress_app -D <dbname> -N -e 'SELECT COUNT(*) FROM wp_options;'   # works
+mysql --ssl -h <primary-endpoint> -u wordpress_app -D <dbname> -e "GRANT ALL PRIVILEGES ON *.* TO 'wordpress_app'@'%';"   # denied
+mysql --ssl -h <primary-endpoint> -u wordpress_app -D <dbname> -e "CREATE DATABASE hacker_test;"                          # denied
+mysql --ssl -h <primary-endpoint> -u wordpress_app -D <dbname> -e "DROP TABLE wp_options;"                                # denied
+mysql --ssl -h <primary-endpoint> -u wordpress_app -D <dbname> -e "ALTER TABLE wp_options ADD COLUMN hacked INT;"         # denied
 ```
 
 Live result: `SELECT` succeeds on both endpoints with real row counts; `GRANT`/`CREATE DATABASE`/`DROP`/`ALTER` all fail with `Access denied`/`... command denied`. Then confirmed the grant set is actually *sufficient*, not just restricted, by running a real create → read → update → delete cycle through WordPress's own PHP API (`wp_insert_post()`/`get_post()`/`wp_update_post()`/`wp_delete_post()`, via `wp-load.php`) rather than raw SQL — proving the app user can do everything WordPress itself needs, end to end, not just that a `SELECT` happens to work.
 
 ## TLS between WordPress and RDS
 
-**Staged rollout, by design** (security gap #2): turning on `require_secure_transport` before confirming WordPress's own connections actually use TLS would reject every existing database connection immediately — a self-inflicted outage. So this ships in two separate stages.
+**Staged rollout, by design** (security gap #2, now fully fixed): turning on `require_secure_transport` before confirming WordPress's own connections actually use TLS would reject every existing database connection immediately — a self-inflicted outage. So this shipped in two separate stages.
 
 ### Stage 1 (shipped): enable TLS client-side, don't enforce it yet
 
@@ -988,9 +990,22 @@ Result: `TLS_AES_256_GCM_SHA384` on the primary (WordPress's default/write conne
 
 **Why this matters for stage 2**: the instance readiness healthcheck in `UserData` (the `mysql -u ... SELECT 1` loop before `cfn-signal`) uses the plain CLI with no `--ssl` flag. Once `require_secure_transport` is turned on, the RDS server will reject that connection outright, and every future instance boot will fail its healthcheck and get rolled back. **Stage 2 must add `--ssl` to those healthcheck commands in the same deploy that enables enforcement, not after.**
 
-### Stage 2 (not yet shipped): enforce it server-side
+### Stage 2 (shipped): enforce it server-side
 
-Planned, not done: set `require_secure_transport: '1'` on `DBParameterGroup` (confirmed live via `describe-db-parameters`: `ApplyType: dynamic`, but `ApplyMethod: pending-reboot` — so it needs an explicit, deliberate reboot of both instances to actually take effect, not just a parameter-group attach), add `--ssl` to the `UserData` healthcheck's `mysql` commands in the same change, deploy, reboot both instances, then verify a plaintext connection attempt is actually rejected.
+Set `require_secure_transport: '1'` on `DBParameterGroup`, and added `--ssl` to every plain `mysql` CLI invocation that needed it: the `UserData` app-user-provisioning step (runs with master credentials), the instance readiness healthcheck (runs with app-user credentials, both endpoints), and `scripts/stack.sh`'s own post-rebuild verification SSH block — all three would otherwise fail once enforcement is live. Deployed in one change: the launch template's `--ssl` fix rolled out via the existing `AutoScalingRollingUpdate` before anything could be affected by enforcement.
+
+**A correction to stage 1's own prediction**: stage 1 said (based on checking the *default* `mysql8.4` parameter group) that `require_secure_transport` has `ApplyMethod: pending-reboot`, meaning both instances would need an explicit reboot after deploying. In practice, once this *custom* parameter group was actually updated with the value, `describe-db-parameters` against it showed `ApplyMethod: immediate` (the parameter's `ApplyType` is `dynamic`, so RDS applied it right away) — confirmed by testing a plaintext connection **immediately after the stack update completed, before any reboot**, and it was already rejected. No reboot was needed or performed. Lesson: the generic info on a *default* parameter group doesn't necessarily predict how a *custom* group you actually modify will apply a given value — check the live, attached group, not the default.
+
+**Verified live, both endpoints, both failure and success paths**:
+```bash
+# plaintext - must be rejected
+mysql -h <primary-or-replica> -u wordpress_app -N -e "SELECT 1;"
+# ERROR 3159 (HY000): Connections using insecure transport are prohibited while --require_secure_transport=ON.
+
+# --ssl - must still work
+mysql --ssl -h <primary-or-replica> -u wordpress_app -N -e "SELECT 1;"   # 1
+```
+Confirmed on both primary and replica. Then, since a synthetic `SELECT 1` proves the connection works but not that the *application* still functions, ran a full create → update → delete cycle through WordPress's own `wp_insert_post()`/`wp_update_post()`/`wp_delete_post()` (not raw SQL) while enforcement was already active — succeeded end to end. Site continued returning 200 throughout.
 
 `RedisReplicationGroup` is a single-node ElastiCache Redis **replication group** (`NumCacheClusters: 1`, `AutomaticFailoverEnabled: false` — a primary with no read replica; see the encryption note below for why this is a `ReplicationGroup` rather than a plain `CacheCluster`) with `RedisNodeType`, default `cache.t3.micro` — eligible for the ElastiCache free tier, in the private subnets, reachable only from `WebServerSecurityGroup` on port 6379 (`RedisSecurityGroup`). No Multi-AZ, no snapshot policy — cache data is inherently disposable (rebuilt from the database on the next read), so there's nothing worth preserving through a node failure or stack teardown.
 
@@ -1135,6 +1150,13 @@ grep -n "DB_PASSWORD\|db-secret" /var/www/html/wp-config.php   # only the requir
 - **Fix**: switch the resource type to `AWS::ElastiCache::ReplicationGroup` with `NumCacheClusters: 1` (one primary, no replica). This is a new logical resource, not an in-place type change — CloudFormation doesn't support changing an existing resource's `Type`, so the old `CacheCluster` resource is removed and a new `ReplicationGroup` resource is added under a different logical ID, with every `!GetAtt`/`!Ref` to it (endpoint address/port in `UserData`, stack `Outputs`) updated to match (`RedisEndpoint.Address` → `PrimaryEndPoint.Address`).
 - **A second error, same deploy**: after switching to `ReplicationGroup` with `NumCacheClusters: 1`, the create then failed with `"When using automatic failover, there must be at least 2 cache clusters in the replication group."` — `AutomaticFailoverEnabled` effectively defaults to `true` in practice, despite the CFN resource schema listing `false` as its default. Fix: set `AutomaticFailoverEnabled: false` explicitly for a single-node cache like this one.
 - See "Redis object cache (ElastiCache)" above for the full encryption/AUTH change this came from.
+
+### RDS parameter's "pending-reboot" apply method didn't actually need a reboot
+
+- **Symptom/setup**: before enforcing `require_secure_transport`, `aws rds describe-db-parameters --db-parameter-group-name default.mysql8.4` showed `ApplyType: dynamic` but `ApplyMethod: pending-reboot` for that parameter — read as "flipping this always needs an explicit instance reboot to take effect," and stage 2 of the TLS rollout was planned around that assumption (deploy, then reboot both instances, then verify).
+- **What actually happened**: after deploying stage 2 (setting `require_secure_transport: '1'` on the *custom* `DBParameterGroup` this stack created and had already attached in stage 1), a plaintext `mysql` connection was tested **immediately, before any reboot** — and it was already rejected with `ERROR 3159: Connections using insecure transport are prohibited`. Re-checking `describe-db-parameters` against the actual attached custom group (not the default one) showed `ApplyMethod: immediate`, not `pending-reboot`.
+- **Cause**: the `pending-reboot` figure came from inspecting AWS's *default* `mysql8.4` parameter group, not the custom one this stack actually uses. A parameter's apply method isn't a fixed fact about the parameter — it reflects how a specific change was (or would be) applied to a specific group, and can differ between a default group and a custom one you create and populate directly, especially for a `dynamic`-type parameter.
+- **Fix/lesson**: don't infer how a change will apply from a *different* parameter group's info (even the engine's own default), when you're about to modify the one actually attached to your instances — check `describe-db-parameters` against **that exact group**, and when in doubt, test the actual behavior empirically right after deploying (a plaintext connection attempt) before assuming a reboot step is still needed. Skipping an unnecessary reboot here meant zero additional downtime for a change that could easily have been assumed to need some.
 
 ### Deleted a file that turned out not to be a temp file (lost, then recovered, the EC2 SSH key pair's `.pem`)
 

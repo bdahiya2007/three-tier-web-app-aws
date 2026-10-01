@@ -2,7 +2,7 @@
 
 Every security issue found in this project's two security reviews (the first after the RDS read replica was added, the second a stack-wide pass), with its severity, the risk of leaving it unfixed, how it was fixed, and how the fix was verified **on the live stack** rather than assumed from a successful deploy.
 
-Last updated: 2026-10-01. Detailed write-ups and full commands are in [Deployment.md](../Deployment.md) and [README.md](../README.md#security-review); this file is the one-page index.
+Last updated: 2026-10-01 (DB TLS enforcement, #2, shipped in full). Detailed write-ups and full commands are in [Deployment.md](../Deployment.md) and [README.md](../README.md#security-review); this file is the one-page index.
 
 ## Severity scale
 
@@ -31,7 +31,7 @@ A change is only marked fixed when the **real dependency** was tested directly: 
 | 9 | No WAF logging | Medium | ✅ Fixed, verified |
 | 14 | No brute-force protection; WordPress/PHP rule groups missing | Medium | ✅ Fixed, verified |
 | 15 | WAF XSS exemption matched its path anywhere in the URL | Medium | ✅ Fixed, verified |
-| 2 | No TLS between WordPress and RDS | Medium | 🟡 Stage 1 of 2 live; enforcement pending |
+| 2 | No TLS between WordPress and RDS | Medium | ✅ Fixed, verified (both stages live) |
 | 1 | RDS not encrypted at rest (primary + replica) | Medium | ⏸ Deferred (owner decision) |
 | 6 | Template changes never reached running instances | Low | ✅ Fixed, verified |
 | 10 | RDS deletion protection off / no Multi-AZ | Low | ✅ Deletion protection fixed; Multi-AZ accepted (cost) |
@@ -147,17 +147,18 @@ A change is only marked fixed when the **real dependency** was tested directly: 
 - **Fix (PR #28):** `OrStatement` of two `STARTS_WITH` matches — `/wp-json/wp/v2/` and `/index.php/wp-json/wp/v2/` (this install uses plain permalinks; a single prefix would have broken every editor save).
 - **Verification:** the old bypass path with an XSS body now returns 403; editor saves through `/index.php/wp-json/wp/v2/...` still succeed.
 
-### #2 — No TLS between WordPress and RDS — 🟡 Stage 1 of 2 live
+### #2 — No TLS between WordPress and RDS — ✅ Fixed
 
 - **Severity:** Medium
 - **Found:** WordPress ↔ RDS connections were unencrypted; the server didn't require TLS.
 - **Risk if not fixed:** DB credentials and all query data travel in plaintext inside the VPC.
 - **Fix:**
-  - **Stage 1 (PR #40, live):** custom `DBParameterGroup` (`mysql8.4`) attached to both instances (in-place, confirmed no replacement via the change set); `MYSQL_CLIENT_FLAGS = MYSQLI_CLIENT_SSL` in `wp-config.php` so every HyperDB connection uses TLS.
-  - **Stage 2 (not started):** `require_secure_transport = 1` (needs a reboot of both instances) **plus `--ssl` on the `UserData` healthcheck's `mysql` commands in the same deploy** — the mariadb CLI doesn't use TLS by default, so without it every future boot would fail its healthcheck.
+  - **Stage 1 (PR #40):** custom `DBParameterGroup` (`mysql8.4`) attached to both instances (in-place, confirmed no replacement via the change set); `MYSQL_CLIENT_FLAGS = MYSQLI_CLIENT_SSL` in `wp-config.php` so every HyperDB connection uses TLS.
+  - **Stage 2 (2026-10-01):** `require_secure_transport = '1'` set on that same `DBParameterGroup`; `--ssl` added to every plain `mysql` CLI call that needed it — the app-user-provisioning step, the instance readiness healthcheck (both endpoints), and `scripts/stack.sh`'s own post-rebuild verification — the mariadb CLI doesn't use TLS by default, so all three would otherwise fail once enforcement is live.
 - **Verification:**
   - Stage 1: `SHOW STATUS LIKE 'Ssl_cipher'` through WordPress's own `$wpdb` → `TLS_AES_256_GCM_SHA384` on the primary; same via `mysqli_real_connect(..., MYSQLI_CLIENT_SSL)` on the replica.
-  - Stage 2 (planned): a plaintext `mysql` login (no `--ssl`) to both endpoints is **rejected**; `--ssl` login and WordPress still work; a new instance boots and signals success.
+  - Stage 2: a plaintext `mysql` login (no `--ssl`) to both endpoints now fails with `ERROR 3159 (HY000): Connections using insecure transport are prohibited`; `--ssl` login still works on both; a full WordPress post create→update→delete cycle (`wp_insert_post`/`wp_update_post`/`wp_delete_post`) succeeded with enforcement already active.
+- **A planning assumption corrected live:** stage 1 expected stage 2 would need an explicit reboot of both instances (`ApplyMethod: pending-reboot` on the *default* `mysql8.4` group). Once deployed, the *custom* group this stack actually uses showed `ApplyMethod: immediate` instead, and a plaintext connection was already rejected before any reboot — so none was performed. The default group's info didn't predict the custom group's actual behavior; see Deployment.md's Troubleshooting section for the full writeup.
 
 ### #1 — RDS not encrypted at rest — ⏸ Deferred
 
