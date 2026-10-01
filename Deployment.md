@@ -658,6 +658,14 @@ sleep 10; aws logs get-query-results --region us-east-1 --query-id "$q"
 
 When the Count-mode rule groups only match obvious attack traffic (scanners, `/.env`, `/wp-config.php.bak` and similar), change that group's `OverrideAction` from `Count: {}` to `None: {}` in the template. That's a normal PR, and the change is non-disruptive. If one specific rule inside a group hits legitimate requests, override just that rule to `Count` with `RuleActionOverrides` (the same pattern as `SizeRestrictions_BODY`) instead of leaving the whole group in Count.
 
+**Promoted to Block (2026-10-01)**: ran the Logs Insights query above against ~2 days / 618 requests. Only **8 matches** across all three rule groups combined, every single one unambiguous scanner traffic — `/.env`, `/.aws/config` (`KnownBadInputs`), and `//xmlrpc.php`/`//wp-includes/wlwmanifest.xml` (`WordPress`) from four different known-bot IP addresses. Zero matches on anything resembling real site or admin traffic, and no `PHP` rule group matches at all in this window. Switched all three to `OverrideAction: None`, deployed, then verified live — not just that the config changed:
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://<domain>/xmlrpc.php                           # 403 (was 200)
+curl -s -o /dev/null -w "%{http_code}\n" https://<domain>/.env                                 # 403 (was 200)
+curl -s -o /dev/null -w "%{http_code}\n" https://<domain>/wp-includes/wlwmanifest.xml           # 403 (was 200)
+curl -s -o /dev/null -w "%{http_code}\n" https://<domain>/                                      # 200, unaffected
+```
+
 Test the rate limit (it should switch from WordPress's own `200` to WAF's `403` after about 100 requests, within a minute or two; WAF rate-based rules aggregate with some delay):
 
 ```bash
@@ -680,6 +688,22 @@ curl -s -o /dev/null -w "XSS pattern: %{http_code}\n" "https://<cloudfront-domai
 ```
 
 If the SQLi/XSS requests return `200` instead of `403`, the rules aren't actually active — check `aws wafv2 get-web-acl` for the current rule list and `aws cloudwatch get-metric-statistics` against the `${EnvironmentName}-waf-sqli`/`${EnvironmentName}-waf-common` metrics (from each rule's `VisibilityConfig`) to confirm the rule groups are receiving and evaluating traffic at all.
+
+### Hardening grab-bag fixes (security gap #17, 2026-10-01)
+
+Four of the smaller, previously-open items, each verified live rather than just deployed:
+
+- **Explicit IMDSv2 enforcement**: `MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }` added to `WebServerLaunchTemplate` (previously relied only on the AL2023 AMI's own default). Verified from inside a live instance: a token-less IMDS request now gets `401`; a request with a real IMDSv2 token still succeeds.
+  ```bash
+  curl -s -o /dev/null -w "%{http_code}\n" http://169.254.169.254/latest/meta-data/instance-id   # 401
+  TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+  curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id   # works
+  ```
+- **CloudFront response-headers policy**: new `CloudFrontResponseHeadersPolicy` (HSTS, `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: strict-origin-when-cross-origin`), attached to `DefaultCacheBehavior`. HSTS uses a conservative 30-day `max-age` with no `includeSubDomains`/`preload` — this is a portfolio project whose domain could change hands later, and preload in particular is effectively permanent across browsers once applied. Verified: `curl -I` on the live site shows all four headers.
+- **`aws:SecureTransport` deny on the ALB logs bucket**: a `Deny *` statement conditioned on `aws:SecureTransport: false`, covering the bucket and its objects. AWS's own log-delivery service only ever uses TLS, so this can't break delivery.
+- **GitHub Actions pinned by commit SHA, not tag**: `actions/checkout@v7`, `aws-actions/configure-aws-credentials@v6`, and `actions/setup-python@v5` all now pin the exact commit SHA that tag currently points to (resolved via `gh api repos/<owner>/<repo>/commits/<tag>`), with the version kept as a trailing comment for readability. A tag can be moved to point at different code later; a commit SHA can't.
+
+Not fixed in this round (left open, listed in `README.md`'s known-gaps section): the ALB→instance hop is still plain HTTP (in-VPC only, lower risk); WordPress/plugin downloads are still unpinned with no checksum verification; `chmod -R 755` on the web root is unchanged (lower impact since the DB password already moved out of those files); and the `terraform/` baseline's issues only matter if that alternate path is ever actually deployed.
 
 ### Publishing a WordPress post fails with "Updating failed"
 
@@ -897,8 +921,8 @@ Found during security architect reviews (the first for this feature; a second, s
 - ~~**Redis has no encryption in transit, at rest, or AUTH token**~~ — **FIXED**: `RedisReplicationGroup` (TLS + AUTH token, see "Redis object cache" below).
 - **No Multi-AZ** on the RDS primary (roughly doubles RDS cost). Deletion protection is now on for both instances.
 - ~~**WordPress connects as the RDS master user**~~ — **FIXED**: a dedicated `wordpress_app` user (see "Least-privilege WordPress DB user" below).
-- **Three WAF managed rule groups are still in Count mode** (`KnownBadInputs`, `WordPress`, `PHP`): they log matches but don't block yet. They switch to Block once the WAF logs show no false positives on real traffic (see "WAF logs and promoting Count rules to Block").
-- **Smaller hardening items:** no explicit `MetadataOptions` (IMDSv2 is enforced today only by the AL2023 AMI default), plain HTTP on the in-VPC ALB→instance hop, unpinned WordPress/plugin downloads with no checksum, `chmod -R 755` on the web root (lower impact since the DB password moved out of `wp-config.php`/`db-config.php` into `/etc/wordpress/db-secret.php`, mode `640`), no CloudFront security-headers policy, no `aws:SecureTransport` deny on the ALB logs bucket, GitHub Actions pinned by tag rather than SHA.
+- ~~**Three WAF managed rule groups were in Count mode**~~ — **FIXED**: switched to Block after reviewing `aws-waf-logs-three-tier-app` (see "WAF logs and promoting Count rules to Block" below for the review and live verification).
+- **Smaller hardening items:** ~~no explicit `MetadataOptions`~~ (**fixed** — `HttpTokens: required` now explicit, verified an IMDSv1 request gets `401` from a live instance), plain HTTP on the in-VPC ALB→instance hop, unpinned WordPress/plugin downloads with no checksum, `chmod -R 755` on the web root (lower impact since the DB password moved out of `wp-config.php`/`db-config.php` into `/etc/wordpress/db-secret.php`, mode `640`), ~~no CloudFront security-headers policy~~ (**fixed** — HSTS/`X-Content-Type-Options`/`X-Frame-Options`/`Referrer-Policy` all confirmed live via `curl -I`), ~~no `aws:SecureTransport` deny on the ALB logs bucket~~ (**fixed**), ~~GitHub Actions pinned by tag rather than SHA~~ (**fixed** — all three actions now pinned by commit SHA with a version comment).
 - **Accepted, not planned:** web servers in public subnets. Moving them to private subnets needs a NAT Gateway (~$33/month + $0.045/GB), which would roughly double the running cost; the security groups already limit HTTP to the ALB and SSH to one IP.
 
 ### Known limitation: replication lag
