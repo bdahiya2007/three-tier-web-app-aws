@@ -1193,6 +1193,16 @@ Resources:
               sed -i "/Add any custom values between this line/r /tmp/https-proxy-fix.php" wp-config.php
               rm -f /tmp/https-proxy-fix.php
 
+              # Stage 1 of TLS in transit (security gap #2): force every wpdb mysqli
+              # connection (both HyperDB entries, primary and replica) to use TLS.
+              # require_secure_transport isn't enabled on RDS yet - that's stage 2,
+              # only after this is confirmed live with a real Ssl_cipher check.
+              cat > /tmp/db-tls-fix.php <<'PHPSNIPPET'
+              define( 'MYSQL_CLIENT_FLAGS', MYSQLI_CLIENT_SSL );
+              PHPSNIPPET
+              sed -i "/Add any custom values between this line/r /tmp/db-tls-fix.php" wp-config.php
+              rm -f /tmp/db-tls-fix.php
+
               mkdir -p /mnt/efs-seed
               for i in 1 2 3 4 5 6; do
                 mount -t efs -o tls ${EFSFileSystem}:/ /mnt/efs-seed && break
@@ -1334,6 +1344,17 @@ Resources:
           Value: !Sub ${EnvironmentName}-wordpress
           PropagateAtLaunch: true
 
+  # Stage 1 of security gap #2 (TLS in transit): just the parameter group,
+  # require_secure_transport left unset (engine default) until WordPress's own
+  # connections are confirmed using TLS - see "Least-privilege WordPress DB
+  # user" / TLS verification notes in Deployment.md. Enforcing it before that's
+  # confirmed would reject every existing connection immediately.
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Family: !Sub mysql${DBEngineVersion}
+      Description: !Sub ${EnvironmentName} MySQL parameter group (TLS rollout, gap #2)
+
   DBInstance:
     Type: AWS::RDS::DBInstance
     DeletionPolicy: Snapshot
@@ -1351,6 +1372,7 @@ Resources:
       # secret. Rotate out of band instead ("Rotate the DB password", Deployment.md).
       MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBMasterSecret}:SecretString:password:AWSCURRENT}}'
       DBSnapshotIdentifier: !If [RestoreFromSnapshot, !Ref DBSnapshotIdentifier, !Ref 'AWS::NoValue']
+      DBParameterGroupName: !Ref DBParameterGroup
       DBSubnetGroupName: !Ref DBSubnetGroup
       VPCSecurityGroups:
         - !Ref DBSecurityGroup
@@ -1376,6 +1398,7 @@ Resources:
       EngineVersion: !Ref DBEngineVersion
       AllowMajorVersionUpgrade: true
       DBInstanceClass: !Ref DBInstanceClass
+      DBParameterGroupName: !Ref DBParameterGroup
       AvailabilityZone: !Ref SecondAvailabilityZone
       PubliclyAccessible: false
       StorageType: gp3

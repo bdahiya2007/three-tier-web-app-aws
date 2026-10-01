@@ -893,7 +893,7 @@ If a real `$wpdb` write through WordPress succeeds without error (it does), and 
 Found during security architect reviews (the first for this feature; a second, stack-wide pass added the items after the first two), deliberately left as-is pending a decision or a planned fix rather than fixed silently:
 
 - **Neither RDS instance is encrypted at rest** (`StorageEncrypted: false` on both). Check with `aws rds describe-db-instances --query "DBInstances[].[DBInstanceIdentifier,StorageEncrypted]"`. This predates the replica, but a read replica must match its source's encryption status — so adding the replica locked this gap into two instances instead of one. Remediation requires snapshot → restore-as-encrypted for the primary (a genuinely disruptive operation — new endpoint, same complexity class as the earlier snapshot-restore work in this file), then recreating the replica from the now-encrypted primary.
-- **No TLS enforcement in transit** between the web tier and either RDS instance (`require_secure_transport` unset, using the MySQL engine default). Check with `aws rds describe-db-parameters --db-parameter-group-name <group> --query "Parameters[?ParameterName=='require_secure_transport']"`. Partially mitigated by VPC-level network isolation (unreachable from outside the VPC regardless), but doesn't meet defense-in-depth for data-in-transit on its own. Lower-risk to remediate than the encryption gap — a parameter group change plus adding SSL context to the MySQL/HyperDB connections, no instance replacement needed.
+- **TLS in transit — stage 1 of 2 shipped, enforcement not yet on.** WordPress's own connections now use TLS (see "TLS between WordPress and RDS" below), but `require_secure_transport` itself is still unset, so a non-TLS connection isn't actually *rejected* yet — only WordPress's own client-side behavior changed so far. Stage 2 (turning enforcement on, after this stage proved stable) is tracked separately.
 - ~~**Redis has no encryption in transit, at rest, or AUTH token**~~ — **FIXED**: `RedisReplicationGroup` (TLS + AUTH token, see "Redis object cache" below).
 - **No Multi-AZ** on the RDS primary (roughly doubles RDS cost). Deletion protection is now on for both instances.
 - ~~**WordPress connects as the RDS master user**~~ — **FIXED**: a dedicated `wordpress_app` user (see "Least-privilege WordPress DB user" below).
@@ -937,7 +937,36 @@ mysql -h <primary-endpoint> -u wordpress_app -D <dbname> -e "ALTER TABLE wp_opti
 
 Live result: `SELECT` succeeds on both endpoints with real row counts; `GRANT`/`CREATE DATABASE`/`DROP`/`ALTER` all fail with `Access denied`/`... command denied`. Then confirmed the grant set is actually *sufficient*, not just restricted, by running a real create → read → update → delete cycle through WordPress's own PHP API (`wp_insert_post()`/`get_post()`/`wp_update_post()`/`wp_delete_post()`, via `wp-load.php`) rather than raw SQL — proving the app user can do everything WordPress itself needs, end to end, not just that a `SELECT` happens to work.
 
-## Redis object cache (ElastiCache)
+## TLS between WordPress and RDS
+
+**Staged rollout, by design** (security gap #2): turning on `require_secure_transport` before confirming WordPress's own connections actually use TLS would reject every existing database connection immediately — a self-inflicted outage. So this ships in two separate stages.
+
+### Stage 1 (shipped): enable TLS client-side, don't enforce it yet
+
+- New `DBParameterGroup` (`AWS::RDS::DBParameterGroup`, `Family: mysql8.4`), attached to both `DBInstance` and `DBReadReplica` via `DBParameterGroupName`. No parameters are actually overridden yet — this stage only gets the custom group in place.
+- `wp-config.php` gets `define('MYSQL_CLIENT_FLAGS', MYSQLI_CLIENT_SSL);`, injected the same way as the CloudFront-Forwarded-Proto fix and the Redis config. This is a global `wpdb` setting, so **every** HyperDB connection (both the primary `write` entry and the replica `read` entry in `db-config.php`) picks it up automatically — no changes needed to `db-config.php` itself.
+- **Attaching `DBParameterGroupName` does not replace the RDS instances.** Confirmed via the change-set before deploying: CloudFormation marks this property `RequiresRecreation: Conditionally`, but the actual AWS rule is that it only replaces the instance if the new group's *family* differs from the current engine's. Here the new group's family (`mysql8.4`) matches exactly, so it's an in-place modify.
+
+**Verified live** — the actual thing that matters, not just that the deploy succeeded:
+```bash
+# On an instance, through WordPress's own $wpdb (not a manual mysql client):
+sudo -u apache php -r '
+define("ABSPATH","/var/www/html/");
+require "/var/www/html/wp-load.php";
+global $wpdb;
+$row = $wpdb->get_row("SHOW STATUS LIKE '\''Ssl_cipher'\''");
+echo $row->Value . PHP_EOL;
+'
+```
+Result: `TLS_AES_256_GCM_SHA384` on the primary (WordPress's default/write connection). Separately confirmed the **replica** too, using the same `mysqli_real_connect(..., MYSQLI_CLIENT_SSL)` call HyperDB makes internally — also `TLS_AES_256_GCM_SHA384`. Both real connections, both genuinely encrypted.
+
+**A real finding, not assumed**: a plain `mysql -h <host> -u wordpress_app ...` with no flags shows an **empty** `Ssl_cipher` on both endpoints — the command-line client does *not* opportunistically upgrade to TLS on its own. Also, this project's `mysql` binary is from the `mariadb105` package, not MySQL's own client, so it doesn't understand MySQL's `--ssl-mode=REQUIRED` syntax (`mysql: unknown variable 'ssl-mode=REQUIRED'`) — the correct flag for this client is simply **`--ssl`** (confirmed live: `mysql ... --ssl -N -e "SHOW STATUS LIKE 'Ssl_cipher';"` returns a real cipher).
+
+**Why this matters for stage 2**: the instance readiness healthcheck in `UserData` (the `mysql -u ... SELECT 1` loop before `cfn-signal`) uses the plain CLI with no `--ssl` flag. Once `require_secure_transport` is turned on, the RDS server will reject that connection outright, and every future instance boot will fail its healthcheck and get rolled back. **Stage 2 must add `--ssl` to those healthcheck commands in the same deploy that enables enforcement, not after.**
+
+### Stage 2 (not yet shipped): enforce it server-side
+
+Planned, not done: set `require_secure_transport: '1'` on `DBParameterGroup` (confirmed live via `describe-db-parameters`: `ApplyType: dynamic`, but `ApplyMethod: pending-reboot` — so it needs an explicit, deliberate reboot of both instances to actually take effect, not just a parameter-group attach), add `--ssl` to the `UserData` healthcheck's `mysql` commands in the same change, deploy, reboot both instances, then verify a plaintext connection attempt is actually rejected.
 
 `RedisReplicationGroup` is a single-node ElastiCache Redis **replication group** (`NumCacheClusters: 1`, `AutomaticFailoverEnabled: false` — a primary with no read replica; see the encryption note below for why this is a `ReplicationGroup` rather than a plain `CacheCluster`) with `RedisNodeType`, default `cache.t3.micro` — eligible for the ElastiCache free tier, in the private subnets, reachable only from `WebServerSecurityGroup` on port 6379 (`RedisSecurityGroup`). No Multi-AZ, no snapshot policy — cache data is inherently disposable (rebuilt from the database on the next read), so there's nothing worth preserving through a node failure or stack teardown.
 
