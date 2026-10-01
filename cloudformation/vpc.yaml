@@ -1180,7 +1180,7 @@ Resources:
               master_pw=$(php -r 'include "/etc/wordpress/db-secret.php"; echo DB_PASSWORD;')
               app_pw=$(php -r 'include "/etc/wordpress/db-app-secret.php"; echo DB_APP_PASSWORD;')
               export MYSQL_PWD="$master_pw"
-              mysql -h ${DBInstance.Endpoint.Address} -u '${DBUsername}' -e "
+              mysql --ssl -h ${DBInstance.Endpoint.Address} -u '${DBUsername}' -e "
                 CREATE USER IF NOT EXISTS '${DBAppUsername}'@'%' IDENTIFIED BY '$app_pw';
                 ALTER USER '${DBAppUsername}'@'%' IDENTIFIED BY '$app_pw';
                 GRANT SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES, LOCK TABLES ON \`${DBName}\`.* TO '${DBAppUsername}'@'%';
@@ -1340,8 +1340,8 @@ Resources:
               ready=false
               for i in $(seq 1 20); do
                 export MYSQL_PWD=$(php -r 'include "/etc/wordpress/db-app-secret.php"; echo DB_APP_PASSWORD;')
-                if mysql -h ${DBInstance.Endpoint.Address} -u '${DBAppUsername}' -N -e 'SELECT 1' >/dev/null 2>&1 \
-                   && mysql -h ${DBReadReplica.Endpoint.Address} -u '${DBAppUsername}' -N -e 'SELECT 1' >/dev/null 2>&1 \
+                if mysql --ssl -h ${DBInstance.Endpoint.Address} -u '${DBAppUsername}' -N -e 'SELECT 1' >/dev/null 2>&1 \
+                   && mysql --ssl -h ${DBReadReplica.Endpoint.Address} -u '${DBAppUsername}' -N -e 'SELECT 1' >/dev/null 2>&1 \
                    && curl -s -f -o /dev/null http://localhost/; then
                   ready=true; break
                 fi
@@ -1389,16 +1389,19 @@ Resources:
           Value: !Sub ${EnvironmentName}-wordpress
           PropagateAtLaunch: true
 
-  # Stage 1 of security gap #2 (TLS in transit): just the parameter group,
-  # require_secure_transport left unset (engine default) until WordPress's own
-  # connections are confirmed using TLS - see "Least-privilege WordPress DB
-  # user" / TLS verification notes in Deployment.md. Enforcing it before that's
-  # confirmed would reject every existing connection immediately.
+  # Stage 2 of security gap #2 (TLS in transit): require_secure_transport now
+  # enforced server-side, after stage 1 confirmed WordPress's own connections
+  # already use TLS (see "TLS between WordPress and RDS" in Deployment.md).
+  # ApplyMethod is pending-reboot (confirmed via describe-db-parameters) - an
+  # explicit reboot of both instances is needed for this to actually take
+  # effect, not just attaching the group.
   DBParameterGroup:
     Type: AWS::RDS::DBParameterGroup
     Properties:
       Family: !Sub mysql${DBEngineVersion}
       Description: !Sub ${EnvironmentName} MySQL parameter group (TLS rollout, gap #2)
+      Parameters:
+        require_secure_transport: '1'
 
   DBInstance:
     Type: AWS::RDS::DBInstance

@@ -248,7 +248,7 @@ for k,v in sorted(p.items()):
       ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "ec2-user@$ip" 'bash -s' "$primary" "$replica" <<'EOF'
 export MYSQL_PWD=$(sudo php -r 'include "/etc/wordpress/db-secret.php"; echo DB_PASSWORD;')
 U=$(sudo sed -n "s/.*'DB_USER', '\([^']*\)'.*/\1/p" /var/www/html/wp-config.php)
-for h in "$@"; do echo "    ${h%%.*}: $(mysql -h "$h" -u "$U" -N -e "SELECT 'login OK', @@read_only" 2>&1 | tail -1)"; done
+for h in "$@"; do echo "    ${h%%.*}: $(mysql --ssl -h "$h" -u "$U" -N -e "SELECT 'login OK', @@read_only" 2>&1 | tail -1)"; done
 EOF
     else
       echo "    Not verified: the database login. Pass --ssh-key to check it, or run the diagnostic in"
