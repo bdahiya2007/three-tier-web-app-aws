@@ -233,3 +233,8 @@ aws cloudformation deploy \
 ## Tech stack
 
 AWS CloudFormation · Amazon CloudFront · AWS WAF (managed rule groups) · Amazon Route 53 · AWS Certificate Manager (DNS validation) · Amazon VPC · Amazon EC2 (Auto Scaling, Launch Templates) · Elastic Load Balancing (Application Load Balancer) · Amazon RDS (MySQL, read replica) · HyperDB (WordPress read/write DB splitting) · Amazon ElastiCache (Redis) · AWS Secrets Manager · Redis Object Cache (WordPress drop-in) · Amazon EFS · AWS Backup · AWS Lambda (custom resource) · Amazon CloudWatch (Dashboards, Logs) · AWS IAM (OIDC federation) · Amazon S3 · Amazon Linux 2023 · PHP 8.3 · Apache · WordPress · Terraform (baseline alternate path) · GitHub Actions
+
+## License
+
+All rights reserved. This repository is a portfolio project, published for viewing. No license is granted to copy, modify or redistribute
+the code. You are welcome to read it and to fork it on GitHub.
