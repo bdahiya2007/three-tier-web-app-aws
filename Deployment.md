@@ -1151,6 +1151,24 @@ grep -n "DB_PASSWORD\|db-secret" /var/www/html/wp-config.php   # only the requir
 - **A second error, same deploy**: after switching to `ReplicationGroup` with `NumCacheClusters: 1`, the create then failed with `"When using automatic failover, there must be at least 2 cache clusters in the replication group."` — `AutomaticFailoverEnabled` effectively defaults to `true` in practice, despite the CFN resource schema listing `false` as its default. Fix: set `AutomaticFailoverEnabled: false` explicitly for a single-node cache like this one.
 - See "Redis object cache (ElastiCache)" above for the full encryption/AUTH change this came from.
 
+### `stack.sh up` fails: "no final snapshot found - pass --snapshot ID"
+
+- **Symptom**: `./scripts/stack.sh up` stops immediately, before creating anything.
+- **Cause**: auto-discovery only matches snapshots named `three-tier-app-network-dbinstance-*` (the name RDS gives the final snapshot on stack deletion). A manually copied snapshot, such as the encrypted copy made for encryption at rest, has a different name and is skipped.
+- **Fix**: pass it explicitly, previewing first: `./scripts/stack.sh up --snapshot <snapshot-id> --dry-run`. Note that `up` deletes the snapshot it restored from once verification passes.
+
+### Stack create/delete fails with `iam:GetRole` / `iam:DeleteRolePolicy` AccessDenied, then `ROLLBACK_FAILED`
+
+- **Symptom**: `stack.sh up` fails on `RdsLogRetentionFunctionRole` (and the rollback fails on the same role) with "not authorized to perform: iam:GetRole".
+- **Cause**: the session was `AWSReservedSSO_PowerUserAccess`, which allows no IAM actions, but the template creates named IAM roles (`CAPABILITY_NAMED_IAM`).
+- **Fix**: give the session IAM permissions scoped to `three-tier-app-*` roles and instance profiles, with `iam:CreateRole`/`PutRolePolicy`/`AttachRolePolicy` conditioned on `iam:PermissionsBoundary` equal to the pipeline stack's `three-tier-app-pipeline-app-role-boundary-arn` export, plus `iam:PassRole` to `ec2`/`lambda`/`backup`. Then delete the `ROLLBACK_FAILED` stack and retry. Check first that the role really doesn't exist (`aws iam get-role`).
+
+### A manually rebuilt stack gets its read replica replaced by the pipeline
+
+- **Symptom**: after `stack.sh up`, a pipeline deploy leaves two read replicas, and the stack sits in `UPDATE_COMPLETE_CLEANUP_IN_PROGRESS` with `DBReadReplica` `DELETE_FAILED` ("Cannot delete protected DB Instance").
+- **Cause**: `up` deployed a local template whose `DBReadReplica` differed from `main`'s (a pinned `DBInstanceIdentifier`), so the next pipeline deploy of `main` replaced the replica. The old one has `DeletionProtection: true`, so CloudFormation can't delete it.
+- **Fix**: run `up` from a checkout that matches `main`. To clean up: `aws rds modify-db-instance --db-instance-identifier <old> --no-deletion-protection --apply-immediately`, then `aws rds delete-db-instance --db-instance-identifier <old> --skip-final-snapshot` (replicas can't take a final snapshot). Don't pin the replica's identifier in the template.
+
 ### RDS parameter's "pending-reboot" apply method didn't actually need a reboot
 
 - **Symptom/setup**: before enforcing `require_secure_transport`, `aws rds describe-db-parameters --db-parameter-group-name default.mysql8.4` showed `ApplyType: dynamic` but `ApplyMethod: pending-reboot` for that parameter — read as "flipping this always needs an explicit instance reboot to take effect," and stage 2 of the TLS rollout was planned around that assumption (deploy, then reboot both instances, then verify).
