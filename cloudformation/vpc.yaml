@@ -1440,6 +1440,15 @@ Resources:
   DBReadReplica:
     Type: AWS::RDS::DBInstance
     # No explicit DependsOn: enforced implicitly via SourceDBInstanceIdentifier.
+    # Retain (not the default Delete): a reasonable permanent safeguard, though
+    # confirmed live it does NOT fully protect against drift - if the physical
+    # replica is ever deleted outside CloudFormation, ANY subsequent operation
+    # on this logical resource still fails with a 404 NotFound (see
+    # Deployment.md Troubleshooting). Replicas can't take a final
+    # snapshot anyway (RDS API limitation, see scripts/stack.sh), so Snapshot
+    # isn't an option here regardless.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       SourceDBInstanceIdentifier: !Ref DBInstance
       DeletionProtection: true

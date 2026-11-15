@@ -98,14 +98,24 @@ cmd_down() {
   $DRY_RUN && echo "    [dry-run] would save them (DBUsername: $db_user, read from RDS since it's NoEcho)" \
            || echo "    saved (NoEcho values like DBUsername are read from RDS instead)"
 
+  # resource_id reports whatever CloudFormation currently believes the physical
+  # ID is, which can be stale (e.g. after a manual out-of-band fix elsewhere)
+  # - confirm the instance actually exists before operating on it directly,
+  # not just that CFN's record is non-empty.
+  db_exists() { [ -n "$1" ] && aws rds describe-db-instances --db-instance-identifier "$1" >/dev/null 2>&1; }
+
   say "2/8 Turning off RDS deletion protection"
   for db in "$primary" "$replica"; do
-    [ -n "$db" ] && run aws rds modify-db-instance --db-instance-identifier "$db" --no-deletion-protection --apply-immediately --query 'DBInstance.DBInstanceIdentifier' --output text
+    if db_exists "$db"; then
+      run aws rds modify-db-instance --db-instance-identifier "$db" --no-deletion-protection --apply-immediately --query 'DBInstance.DBInstanceIdentifier' --output text
+    elif [ -n "$db" ]; then
+      echo "    $db: CloudFormation's record is stale, no such instance - skipping"
+    fi
   done
   $DRY_RUN || aws rds wait db-instance-available --db-instance-identifier "$primary"
 
   say "3/8 Deleting the read replica (replicas can't take a final snapshot)"
-  if [ -n "$replica" ]; then
+  if db_exists "$replica"; then
     run aws rds delete-db-instance --db-instance-identifier "$replica" --skip-final-snapshot --query 'DBInstance.DBInstanceStatus' --output text
     $DRY_RUN || aws rds wait db-instance-deleted --db-instance-identifier "$replica"
   fi
