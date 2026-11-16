@@ -57,10 +57,29 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # The stack is torn down on purpose between uses (scripts/stack.sh down) and
+      # rebuilt with scripts/stack.sh up, never by this workflow: it has no way to
+      # restore the DB from a snapshot. So a missing stack is a skip, not a failure.
+      # Any other describe-stacks error (permissions, throttling) still fails the job.
+      - name: Check the stack exists
+        run: |
+          if out=$(aws cloudformation describe-stacks \
+                     --stack-name ${{ env.STACK_NAME }} \
+                     --region ${{ env.AWS_REGION }} 2>&1); then
+            echo "STACK_EXISTS=true" >> "$GITHUB_ENV"
+          elif grep -q "does not exist" <<< "$out"; then
+            echo "STACK_EXISTS=false" >> "$GITHUB_ENV"
+            echo "::notice::${{ env.STACK_NAME }} doesn't exist (torn down with stack.sh down) - skipping deploy. Rebuild with scripts/stack.sh up."
+          else
+            echo "$out" >&2
+            exit 1
+          fi
+
       # Templates go via S3 (TemplateURL, 1 MB limit) instead of inline
       # TemplateBody (51,200 bytes, which this template outgrew). The bucket
       # is the stack's own CfnArtifactsBucket.
       - name: Upload and validate CloudFormation template
+        if: env.STACK_EXISTS == 'true'
         run: |
           bucket=$(aws cloudformation describe-stacks \
             --stack-name ${{ env.STACK_NAME }} \
@@ -76,6 +95,7 @@ jobs:
             --region ${{ env.AWS_REGION }}
 
       - name: Deploy CloudFormation stack
+        if: env.STACK_EXISTS == 'true'
         run: |
           aws cloudformation deploy \
             --template-file ${{ env.TEMPLATE_FILE }} \
@@ -88,6 +108,7 @@ jobs:
               KeyPairName=${{ secrets.KEY_PAIR_NAME }}
 
       - name: Show stack outputs
+        if: env.STACK_EXISTS == 'true'
         run: |
           aws cloudformation describe-stacks \
             --stack-name ${{ env.STACK_NAME }} \

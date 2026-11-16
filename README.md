@@ -228,7 +228,7 @@ aws cloudformation deploy \
     KeyPairName=<your-existing-ec2-key-pair-name>
 ```
 
-**Idle cost control:** `scripts/stack.sh down` deletes the app stack with one command, keeping the database as a final snapshot, and `scripts/stack.sh up` rebuilds it from that snapshot. See [Deployment.md](Deployment.md#tear-down-and-rebuild-cost-saving); `down`/`up` need IAM permissions (the stack creates named roles) and `up --snapshot ID` for a manually copied snapshot - see its Troubleshooting entries.
+**Idle cost control:** `scripts/stack.sh down` deletes the app stack with one command, keeping the database as a final snapshot, and `scripts/stack.sh up` rebuilds it from that snapshot. See [Deployment.md](Deployment.md#tear-down-and-rebuild-cost-saving); `down`/`up` need IAM permissions (the stack creates named roles) and `up --snapshot ID` for a manually copied snapshot - see its Troubleshooting entries. While the stack is down, the deploy workflow skips instead of failing.
 
 ## Tech stack
 
