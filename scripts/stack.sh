@@ -53,9 +53,12 @@ billable_leftovers() {
   command aws cloudfront list-distributions --query "DistributionList.Items[?contains(to_string(Aliases.Items),'blog.securecloudengineers.com')].['CloudFront',Id,Status]" --output text 2>/dev/null || true
 }
 
+# RDS has named the final snapshot both '<stack>-dbinstance-...' and
+# '<stack>-snapshot-dbinstance-...'; match either. Manually copied snapshots with
+# other names are not picked up - pass --snapshot for those.
 latest_final_snapshot() {
   aws rds describe-db-snapshots --snapshot-type manual \
-    --query "reverse(sort_by(DBSnapshots[?starts_with(DBSnapshotIdentifier,'$STACK-dbinstance') && Status=='available'],&SnapshotCreateTime))[0].DBSnapshotIdentifier" --output text
+    --query "reverse(sort_by(DBSnapshots[?(starts_with(DBSnapshotIdentifier,'$STACK-dbinstance') || starts_with(DBSnapshotIdentifier,'$STACK-snapshot-dbinstance')) && Status=='available'],&SnapshotCreateTime))[0].DBSnapshotIdentifier" --output text
 }
 
 cmd_status() {
