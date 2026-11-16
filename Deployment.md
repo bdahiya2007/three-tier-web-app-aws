@@ -1154,7 +1154,7 @@ grep -n "DB_PASSWORD\|db-secret" /var/www/html/wp-config.php   # only the requir
 ### `stack.sh up` fails: "no final snapshot found - pass --snapshot ID"
 
 - **Symptom**: `./scripts/stack.sh up` stops immediately, before creating anything.
-- **Cause**: auto-discovery only matches snapshots named `three-tier-app-network-dbinstance-*` (the name RDS gives the final snapshot on stack deletion). A manually copied snapshot, such as the encrypted copy made for encryption at rest, has a different name and is skipped.
+- **Cause**: auto-discovery only matches snapshots named `three-tier-app-network-dbinstance-*` or `three-tier-app-network-snapshot-dbinstance-*` (the two names RDS has given the final snapshot on stack deletion; before the second pattern was added, the latter was missed too). A manually copied snapshot, such as the encrypted copy made for encryption at rest, has a different name and is skipped.
 - **Fix**: pass it explicitly, previewing first: `./scripts/stack.sh up --snapshot <snapshot-id> --dry-run`. Note that `up` deletes the snapshot it restored from once verification passes.
 
 ### Stack create/delete fails with `iam:GetRole` / `iam:DeleteRolePolicy` AccessDenied, then `ROLLBACK_FAILED`
